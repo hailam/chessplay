@@ -36,6 +36,12 @@ type MoveOrderer struct {
 
 	// Counter move heuristic (indexed by [piece][to])
 	counterMoves [12][64]board.Move
+
+	// Capture history (indexed by [attackerPiece][toSquare][capturedPieceType])
+	captureHistory [12][64][6]int
+
+	// Countermove history (indexed by [prevPiece][prevTo][movePiece][moveTo])
+	countermoveHistory [12][64][12][64]int
 }
 
 // NewMoveOrderer creates a new move orderer.
@@ -64,6 +70,26 @@ func (mo *MoveOrderer) Clear() {
 			mo.counterMoves[i][j] = board.NoMove
 		}
 	}
+
+	// Age capture history
+	for i := range mo.captureHistory {
+		for j := range mo.captureHistory[i] {
+			for k := range mo.captureHistory[i][j] {
+				mo.captureHistory[i][j][k] /= 2
+			}
+		}
+	}
+
+	// Age countermove history
+	for i := range mo.countermoveHistory {
+		for j := range mo.countermoveHistory[i] {
+			for k := range mo.countermoveHistory[i][j] {
+				for l := range mo.countermoveHistory[i][j][k] {
+					mo.countermoveHistory[i][j][k][l] /= 2
+				}
+			}
+		}
+	}
 }
 
 // ScoreMoves assigns scores to moves for ordering.
@@ -73,6 +99,37 @@ func (mo *MoveOrderer) ScoreMoves(pos *board.Position, moves *board.MoveList, pl
 	for i := 0; i < moves.Len(); i++ {
 		move := moves.Get(i)
 		scores[i] = mo.scoreMove(pos, move, ply, ttMove)
+	}
+
+	return scores
+}
+
+// ScoreMovesWithCounter assigns scores including counter-move and CMH bonus.
+func (mo *MoveOrderer) ScoreMovesWithCounter(pos *board.Position, moves *board.MoveList, ply int, ttMove, prevMove board.Move) []int {
+	scores := make([]int, moves.Len())
+	counterMove := mo.GetCounterMove(prevMove, pos)
+
+	// Get previous piece for CMH lookup
+	var prevPiece board.Piece = board.NoPiece
+	if prevMove != board.NoMove {
+		prevPiece = pos.PieceAt(prevMove.To())
+	}
+
+	for i := 0; i < moves.Len(); i++ {
+		move := moves.Get(i)
+		scores[i] = mo.scoreMove(pos, move, ply, ttMove)
+
+		// Counter-move bonus (after killers, before history)
+		if move == counterMove && scores[i] < KillerScore2 {
+			scores[i] = KillerScore2 - 10000 // Just below second killer
+		}
+
+		// Add countermove history bonus for quiet moves
+		if !move.IsCapture(pos) && !move.IsPromotion() && move != ttMove {
+			movePiece := pos.PieceAt(move.From())
+			cmhScore := mo.GetCountermoveHistoryScore(prevMove, prevPiece, movePiece, move.To())
+			scores[i] += cmhScore / 2 // Scale down to not dominate
+		}
 	}
 
 	return scores
@@ -116,12 +173,13 @@ func (mo *MoveOrderer) scoreMove(pos *board.Position, m board.Move, ply int, ttM
 		// Check if it's a winning capture using MVV-LVA
 		score := GoodCaptureBase + mvvLva[victim][attacker]*1000
 
+		// Add capture history bonus
+		captureHistScore := mo.GetCaptureHistoryScore(attackerPiece, to, victim)
+		score += captureHistScore / 4 // Scale appropriately
+
 		// Bonus for capturing with a less valuable piece
 		if pieceValues[attacker] < pieceValues[victim] {
 			score += 10000 // Clearly winning capture
-		} else if pieceValues[attacker] > pieceValues[victim] {
-			// Potentially losing capture - but still try before quiet moves
-			// Could use SEE here for more accuracy
 		}
 
 		return score
@@ -247,4 +305,91 @@ func (mo *MoveOrderer) GetCounterMove(prevMove board.Move, pos *board.Position) 
 	}
 
 	return mo.counterMoves[piece][prevMove.To()]
+}
+
+// GetHistoryScore returns the history score for a move.
+// Used for history pruning in search.
+func (mo *MoveOrderer) GetHistoryScore(m board.Move) int {
+	return mo.history[m.From()][m.To()]
+}
+
+// UpdateCaptureHistory updates the capture history for a move.
+func (mo *MoveOrderer) UpdateCaptureHistory(attackerPiece board.Piece, toSq board.Square, capturedType board.PieceType, depth int, isGood bool) {
+	if attackerPiece == board.NoPiece || capturedType >= board.King {
+		return
+	}
+
+	bonus := depth * depth
+	if isGood {
+		mo.captureHistory[attackerPiece][toSq][capturedType] += bonus
+		if mo.captureHistory[attackerPiece][toSq][capturedType] > 400000 {
+			mo.scaleCaptureHistory()
+		}
+	} else {
+		mo.captureHistory[attackerPiece][toSq][capturedType] -= bonus
+		if mo.captureHistory[attackerPiece][toSq][capturedType] < -400000 {
+			mo.captureHistory[attackerPiece][toSq][capturedType] = -400000
+		}
+	}
+}
+
+func (mo *MoveOrderer) scaleCaptureHistory() {
+	for i := range mo.captureHistory {
+		for j := range mo.captureHistory[i] {
+			for k := range mo.captureHistory[i][j] {
+				mo.captureHistory[i][j][k] /= 2
+			}
+		}
+	}
+}
+
+// GetCaptureHistoryScore returns the capture history score for a capture move.
+func (mo *MoveOrderer) GetCaptureHistoryScore(attackerPiece board.Piece, toSq board.Square, capturedType board.PieceType) int {
+	if attackerPiece == board.NoPiece || capturedType >= board.King {
+		return 0
+	}
+	return mo.captureHistory[attackerPiece][toSq][capturedType]
+}
+
+// UpdateCountermoveHistory updates the countermove history for a quiet move.
+func (mo *MoveOrderer) UpdateCountermoveHistory(prevMove, goodMove board.Move, prevPiece, movePiece board.Piece, depth int, isGood bool) {
+	if prevMove == board.NoMove || prevPiece == board.NoPiece || movePiece == board.NoPiece {
+		return
+	}
+
+	prevTo := prevMove.To()
+	moveTo := goodMove.To()
+	bonus := depth * depth
+
+	if isGood {
+		mo.countermoveHistory[prevPiece][prevTo][movePiece][moveTo] += bonus
+		if mo.countermoveHistory[prevPiece][prevTo][movePiece][moveTo] > 400000 {
+			mo.scaleCountermoveHistory()
+		}
+	} else {
+		mo.countermoveHistory[prevPiece][prevTo][movePiece][moveTo] -= bonus
+		if mo.countermoveHistory[prevPiece][prevTo][movePiece][moveTo] < -400000 {
+			mo.countermoveHistory[prevPiece][prevTo][movePiece][moveTo] = -400000
+		}
+	}
+}
+
+func (mo *MoveOrderer) scaleCountermoveHistory() {
+	for i := range mo.countermoveHistory {
+		for j := range mo.countermoveHistory[i] {
+			for k := range mo.countermoveHistory[i][j] {
+				for l := range mo.countermoveHistory[i][j][k] {
+					mo.countermoveHistory[i][j][k][l] /= 2
+				}
+			}
+		}
+	}
+}
+
+// GetCountermoveHistoryScore returns the CMH score for a move given the previous move.
+func (mo *MoveOrderer) GetCountermoveHistoryScore(prevMove board.Move, prevPiece, movePiece board.Piece, moveTo board.Square) int {
+	if prevMove == board.NoMove || prevPiece == board.NoPiece || movePiece == board.NoPiece {
+		return 0
+	}
+	return mo.countermoveHistory[prevPiece][prevMove.To()][movePiece][moveTo]
 }

@@ -92,6 +92,9 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 		deadline = startTime.Add(limits.MoveTime)
 	}
 
+	// Aspiration window parameters
+	const initialWindow = 50 // Start with ±50 centipawns
+
 	// Iterative deepening
 	for depth := 1; depth <= maxDepth; depth++ {
 		// Check time before starting new iteration
@@ -99,8 +102,44 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 			break
 		}
 
-		// Search at current depth
-		move, score := e.searcher.Search(pos, depth)
+		var move board.Move
+		var score int
+
+		// Use aspiration windows after depth 4 and when we have a previous score
+		if depth >= 5 && bestMove != board.NoMove {
+			window := initialWindow
+			alpha := bestScore - window
+			beta := bestScore + window
+
+			// Aspiration window search with widening
+			for {
+				move, score = e.searcher.SearchWithBounds(pos, depth, alpha, beta)
+
+				// Check if search was stopped
+				if e.searcher.stopFlag.Load() {
+					break
+				}
+
+				if score <= alpha {
+					// Fail low - widen window down
+					alpha = -Infinity
+				} else if score >= beta {
+					// Fail high - widen window up
+					beta = Infinity
+				} else {
+					// Score within window, we're done
+					break
+				}
+
+				// If both bounds are infinite, we've done a full search
+				if alpha == -Infinity && beta == Infinity {
+					break
+				}
+			}
+		} else {
+			// Full window search for early depths
+			move, score = e.searcher.Search(pos, depth)
+		}
 
 		// Check if search was stopped
 		if e.searcher.stopFlag.Load() {

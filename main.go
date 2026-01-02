@@ -15,6 +15,9 @@ func main() {
 	ebiten.SetWindowTitle("ChessPlay")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 
+	// Enable smooth scaling when window is resized or fullscreen
+	ebiten.SetScreenFilterEnabled(true)
+
 	if err := ebiten.RunGame(game); err != nil {
 		log.Fatal(err)
 	}

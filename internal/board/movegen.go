@@ -384,22 +384,169 @@ func (p *Position) generateCaptures(ml *MoveList) {
 	}
 }
 
-// filterLegalMoves filters out illegal moves (those that leave king in check).
+// DebugLegalMoveVerification enables dual-path verification in filterLegalMoves.
+// Set to true during development to catch any fast path bugs.
+var DebugLegalMoveVerification = false
+
+// filterLegalMoves filters out illegal moves using Stockfish's optimization.
+// Non-pinned, non-king, non-en-passant moves are automatically legal (when not in check).
 func (p *Position) filterLegalMoves(ml *MoveList) *MoveList {
 	result := NewMoveList()
+	pinned := p.ComputePinned() // Compute once for all moves
+	ksq := p.KingSquare[p.SideToMove]
+	inCheck := p.Checkers != 0
 
 	for i := 0; i < ml.Len(); i++ {
 		m := ml.Get(i)
-		if p.IsLegal(m) {
+		from := m.From()
+
+		// When in check, only king moves can use the fast path
+		// (other pieces must block or capture, which requires validation)
+		if inCheck {
+			if p.IsLegalFast(m, pinned) {
+				result.Add(m)
+			}
+			continue
+		}
+
+		// Fast path: non-pinned, non-king, non-EP moves are automatically legal
+		if from != ksq && !m.IsEnPassant() && pinned&SquareBB(from) == 0 {
+			if DebugLegalMoveVerification {
+				// Verify fast path against slow path
+				slowResult := p.IsLegal(m)
+				if !slowResult {
+					fmt.Printf("DEBUG MISMATCH: Fast path accepted move %v but slow path rejected it\n", m)
+					fmt.Printf("DEBUG: pinned=%v from=%v ksq=%v\n", pinned, from, ksq)
+					continue // Trust slow path in debug mode
+				}
+			}
 			result.Add(m)
+			continue
+		}
+
+		// Slow path: pinned pieces, king moves, or en passant
+		if p.IsLegalFast(m, pinned) {
+			if DebugLegalMoveVerification {
+				// Verify against original slow path
+				slowResult := p.IsLegal(m)
+				if !slowResult {
+					fmt.Printf("DEBUG MISMATCH: IsLegalFast accepted move %v but IsLegal rejected it\n", m)
+					continue
+				}
+			}
+			result.Add(m)
+		} else if DebugLegalMoveVerification {
+			// Check if slow path would have accepted it
+			if p.IsLegal(m) {
+				fmt.Printf("DEBUG MISMATCH: IsLegalFast rejected move %v but IsLegal accepted it\n", m)
+				result.Add(m)
+			}
 		}
 	}
 
 	return result
 }
 
+// IsLegalFast returns true if the move is legal using Stockfish's optimization.
+// Key insight: non-pinned, non-king, non-en-passant moves are automatically legal.
+// This avoids expensive make/unmake for ~90% of moves.
+func (p *Position) IsLegalFast(m Move, pinned Bitboard) bool {
+	from := m.From()
+	to := m.To()
+	us := p.SideToMove
+	them := us.Other()
+	ksq := p.KingSquare[us]
+	checkers := p.Checkers
+
+	// King moves: check destination not attacked (with king removed from occupancy)
+	if from == ksq {
+		if m.IsCastling() {
+			// Castling is not allowed when in check (and was validated during generation)
+			return checkers == 0
+		}
+		occ := p.AllOccupied &^ SquareBB(from)
+		return p.AttackersByColor(to, them, occ) == 0
+	}
+
+	// When in check, non-king moves must block or capture the checker
+	if checkers != 0 {
+		// Double check: only king can move
+		if checkers.PopCount() > 1 {
+			return false
+		}
+
+		// Single check: must capture checker or block
+		checker := checkers.LSB()
+		// Valid targets: the checker square OR squares between checker and king
+		validTargets := SquareBB(checker) | Between(checker, ksq)
+
+		// En passant special case: the captured pawn might be the checker
+		if m.IsEnPassant() {
+			var capturedSq Square
+			if us == White {
+				capturedSq = to - 8
+			} else {
+				capturedSq = to + 8
+			}
+			// If en passant captures the checker, it's potentially valid
+			// (still need to verify horizontal pin, use slow path)
+			if capturedSq == checker {
+				return p.isLegalEnPassant(m)
+			}
+			// Otherwise can't block with en passant
+			return false
+		}
+
+		// Move must go to a valid target (block or capture)
+		if validTargets&SquareBB(to) == 0 {
+			return false
+		}
+
+		// Also check pin constraint
+		if pinned&SquareBB(from) != 0 && !Aligned(from, to, ksq) {
+			return false
+		}
+
+		return true
+	}
+
+	// Not in check - use normal logic
+
+	// En passant: use slow path (horizontal pin edge case where two pawns are removed)
+	if m.IsEnPassant() {
+		return p.isLegalEnPassant(m)
+	}
+
+	// Non-pinned pieces: automatically legal (cannot expose king)
+	if pinned&SquareBB(from) == 0 {
+		return true
+	}
+
+	// Pinned pieces: legal only if moving along the pin ray
+	return Aligned(from, to, ksq)
+}
+
+// isLegalEnPassant validates en passant moves using make/unmake.
+// En passant is special because it removes two pawns, which can expose
+// horizontal attacks on the king that aren't detected by the normal pin logic.
+func (p *Position) isLegalEnPassant(m Move) bool {
+	us := p.SideToMove
+	them := us.Other()
+	ksq := p.KingSquare[us]
+
+	undo := p.MakeMove(m)
+	if !undo.Valid {
+		return false
+	}
+
+	attacked := p.IsSquareAttacked(ksq, them)
+	p.UnmakeMove(m, undo)
+
+	return !attacked
+}
+
 // IsLegal returns true if the move is legal (doesn't leave king in check).
-// Uses make/unmake for guaranteed correctness.
+// Uses make/unmake for guaranteed correctness. Kept for debugging/validation.
 func (p *Position) IsLegal(m Move) bool {
 	us := p.SideToMove
 	them := us.Other()
@@ -438,6 +585,71 @@ func (p *Position) IsLegal(m Move) bool {
 	p.UnmakeMove(m, undo)
 
 	return !attacked
+}
+
+// GenerateChecks generates non-capture moves that give check.
+// Used in quiescence search to find forcing moves beyond captures.
+func (p *Position) GenerateChecks() *MoveList {
+	ml := NewMoveList()
+	p.generateChecks(ml)
+	return p.filterLegalMoves(ml)
+}
+
+// generateChecks generates pseudo-legal non-capture check-giving moves.
+func (p *Position) generateChecks(ml *MoveList) {
+	us := p.SideToMove
+	them := us.Other()
+	enemyKing := p.KingSquare[them]
+	occupied := p.AllOccupied
+	empty := ^occupied
+
+	// Knight checks: find squares that attack enemy king and move knights there
+	knightCheckSquares := KnightAttacks(enemyKing) & empty
+	knights := p.Pieces[us][Knight]
+	for knights != 0 {
+		from := knights.PopLSB()
+		attacks := KnightAttacks(from) & knightCheckSquares
+		for attacks != 0 {
+			to := attacks.PopLSB()
+			ml.Add(NewMove(from, to))
+		}
+	}
+
+	// Bishop checks: find squares on diagonals to enemy king
+	bishopCheckSquares := BishopAttacks(enemyKing, occupied) & empty
+	bishops := p.Pieces[us][Bishop]
+	for bishops != 0 {
+		from := bishops.PopLSB()
+		attacks := BishopAttacks(from, occupied) & bishopCheckSquares
+		for attacks != 0 {
+			to := attacks.PopLSB()
+			ml.Add(NewMove(from, to))
+		}
+	}
+
+	// Rook checks: find squares on files/ranks to enemy king
+	rookCheckSquares := RookAttacks(enemyKing, occupied) & empty
+	rooks := p.Pieces[us][Rook]
+	for rooks != 0 {
+		from := rooks.PopLSB()
+		attacks := RookAttacks(from, occupied) & rookCheckSquares
+		for attacks != 0 {
+			to := attacks.PopLSB()
+			ml.Add(NewMove(from, to))
+		}
+	}
+
+	// Queen checks: both diagonal and straight
+	queenCheckSquares := bishopCheckSquares | rookCheckSquares
+	queens := p.Pieces[us][Queen]
+	for queens != 0 {
+		from := queens.PopLSB()
+		attacks := QueenAttacks(from, occupied) & queenCheckSquares
+		for attacks != 0 {
+			to := attacks.PopLSB()
+			ml.Add(NewMove(from, to))
+		}
+	}
 }
 
 // MakeMove applies a move to the position and returns undo information.
@@ -649,8 +861,9 @@ func (p *Position) UnmakeMove(m Move, undo UndoInfo) {
 // HasLegalMoves returns true if the side to move has any legal moves.
 func (p *Position) HasLegalMoves() bool {
 	ml := p.GeneratePseudoLegalMoves()
+	pinned := p.ComputePinned()
 	for i := 0; i < ml.Len(); i++ {
-		if p.IsLegal(ml.Get(i)) {
+		if p.IsLegalFast(ml.Get(i), pinned) {
 			return true
 		}
 	}

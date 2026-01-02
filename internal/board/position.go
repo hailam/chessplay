@@ -305,3 +305,63 @@ func (p *Position) ComputePinned() Bitboard {
 
 	return pinned
 }
+
+// nullMoveUndo stores state for unmake of null move.
+type nullMoveUndo struct {
+	EnPassant Square
+	Hash      uint64
+}
+
+// nullMoveStack stores null move undo info (simple stack).
+var nullMoveStack []nullMoveUndo
+
+// MakeNullMove makes a null move (passes the turn without moving).
+// Used for null move pruning in search.
+func (p *Position) MakeNullMove() {
+	// Save state for unmake
+	nullMoveStack = append(nullMoveStack, nullMoveUndo{
+		EnPassant: p.EnPassant,
+		Hash:      p.Hash,
+	})
+
+	// Update hash for en passant removal
+	if p.EnPassant != NoSquare {
+		p.Hash ^= zobristEnPassant[p.EnPassant.File()]
+	}
+
+	// Clear en passant
+	p.EnPassant = NoSquare
+
+	// Switch side
+	p.SideToMove = p.SideToMove.Other()
+	p.Hash ^= zobristSideToMove
+
+	// Update checkers for new side
+	p.UpdateCheckers()
+}
+
+// UnmakeNullMove undoes a null move.
+func (p *Position) UnmakeNullMove() {
+	// Pop from stack
+	n := len(nullMoveStack)
+	if n == 0 {
+		return
+	}
+	undo := nullMoveStack[n-1]
+	nullMoveStack = nullMoveStack[:n-1]
+
+	// Restore state
+	p.EnPassant = undo.EnPassant
+	p.Hash = undo.Hash
+	p.SideToMove = p.SideToMove.Other()
+
+	// Update checkers for restored side
+	p.UpdateCheckers()
+}
+
+// HasNonPawnMaterial returns true if the side to move has non-pawn material.
+// Used for null move pruning (avoid in pure pawn endgames due to zugzwang).
+func (p *Position) HasNonPawnMaterial() bool {
+	us := p.SideToMove
+	return p.Pieces[us][Knight]|p.Pieces[us][Bishop]|p.Pieces[us][Rook]|p.Pieces[us][Queen] != 0
+}

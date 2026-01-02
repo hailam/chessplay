@@ -9,88 +9,182 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
-// Button represents a clickable button.
+// Panel dimensions
+const (
+	PanelPadding    = 20
+	SectionSpacing  = 28
+	ButtonHeight    = 40
+	TabHeight       = 34
+	CollapsedWidth  = 36
+	CollapseButtonW = 28
+	CollapseButtonH = 80
+	SectionLabelH   = 20
+)
+
+// Panel colors
+var (
+	panelBg         = color.RGBA{38, 40, 45, 255}    // Dark background
+	sectionBg       = color.RGBA{48, 52, 58, 255}    // Slightly lighter section
+	tabActiveBg     = color.RGBA{76, 132, 96, 255}   // Green for active tab
+	tabInactiveBg   = color.RGBA{58, 62, 68, 255}    // Gray for inactive
+	tabHoverBg      = color.RGBA{68, 72, 78, 255}    // Hover state
+	buttonBg        = color.RGBA{58, 62, 68, 255}    // Button background
+	buttonHoverBg   = color.RGBA{78, 82, 88, 255}    // Button hover
+	buttonActiveBg  = color.RGBA{76, 132, 96, 255}   // Active button (green)
+	accentColor     = color.RGBA{76, 175, 120, 255}  // Green accent
+	textPrimary     = color.RGBA{240, 240, 245, 255} // Primary text
+	textSecondary   = color.RGBA{160, 165, 175, 255} // Secondary text
+	textMuted       = color.RGBA{120, 125, 135, 255} // Muted text
+	dividerColor    = color.RGBA{60, 65, 72, 255}    // Divider line
+	moveRowAlt      = color.RGBA{44, 48, 54, 255}    // Alternating row
+	statusThinking  = color.RGBA{100, 180, 255, 255} // Blue for thinking
+	statusGameOver  = color.RGBA{255, 200, 80, 255}  // Yellow for game over
+	collapseButtonC = color.RGBA{58, 62, 68, 255}    // Collapse button
+)
+
+// Button represents a clickable UI element.
 type Button struct {
 	X, Y, W, H int
 	Label      string
 	OnClick    func()
 	hovered    bool
-	active     bool // For toggle buttons
+	active     bool
 }
 
 // Panel represents the side panel with controls and move history.
 type Panel struct {
-	game        *Game
-	buttons     []*Button
-	diffButtons []*Button
-	scrollY     int
+	game      *Game
+	collapsed bool
+
+	// UI elements
+	collapseBtn *Button
+	newGameBtn  *Button
+	modeTabs    []*Button // [0] = vs Human, [1] = vs Computer
+	diffTabs    []*Button // [0] = Easy, [1] = Medium, [2] = Hard
+
+	// Move history scroll
+	scrollY    int
+	maxScrollY int
 }
 
 // NewPanel creates a new panel for the given game.
 func NewPanel(g *Game) *Panel {
 	p := &Panel{
-		game: g,
+		game:      g,
+		collapsed: false,
 	}
 
-	// New Game button
-	p.buttons = append(p.buttons, &Button{
-		X: BoardSize + 20, Y: 20, W: 130, H: 40,
-		Label:   "New Game",
-		OnClick: g.NewGameAction,
-	})
-
-	// Mode toggle button
-	p.buttons = append(p.buttons, &Button{
-		X: BoardSize + 160, Y: 20, W: 130, H: 40,
-		Label:   "vs Computer",
-		OnClick: g.ToggleModeAction,
-	})
-
-	// Difficulty buttons
-	diffY := 75
-	p.diffButtons = append(p.diffButtons, &Button{
-		X: BoardSize + 20, Y: diffY, W: 85, H: 30,
-		Label:   "Easy",
-		OnClick: func() { g.SetDifficulty(DifficultyEasy) },
-	})
-	p.diffButtons = append(p.diffButtons, &Button{
-		X: BoardSize + 115, Y: diffY, W: 85, H: 30,
-		Label:   "Medium",
-		OnClick: func() { g.SetDifficulty(DifficultyMedium) },
-	})
-	p.diffButtons = append(p.diffButtons, &Button{
-		X: BoardSize + 210, Y: diffY, W: 85, H: 30,
-		Label:   "Hard",
-		OnClick: func() { g.SetDifficulty(DifficultyHard) },
-	})
-
+	p.createButtons()
 	return p
+}
+
+// createButtons initializes all panel buttons.
+func (p *Panel) createButtons() {
+	// Collapse/expand button (on right edge of panel, or centered when collapsed)
+	if p.collapsed {
+		p.collapseBtn = &Button{
+			X: BoardSize + (CollapsedWidth-CollapseButtonW)/2,
+			Y: (ScreenHeight - CollapseButtonH) / 2,
+			W: CollapseButtonW, H: CollapseButtonH,
+			OnClick: func() { p.toggleCollapse() },
+		}
+	} else {
+		p.collapseBtn = &Button{
+			X: BoardSize + PanelWidth - CollapseButtonW - 4,
+			Y: (ScreenHeight - CollapseButtonH) / 2,
+			W: CollapseButtonW, H: CollapseButtonH,
+			OnClick: func() { p.toggleCollapse() },
+		}
+	}
+
+	// Content area
+	contentX := BoardSize + PanelPadding
+	contentW := PanelWidth - PanelPadding*2 - CollapseButtonW
+
+	// New Game button (full width, prominent)
+	newGameY := PanelPadding + 8
+	p.newGameBtn = &Button{
+		X: contentX, Y: newGameY,
+		W: contentW, H: ButtonHeight,
+		Label:   "New Game",
+		OnClick: p.game.NewGameAction,
+	}
+
+	// Mode section: label + tabs
+	modeLabelY := newGameY + ButtonHeight + SectionSpacing
+	modeTabY := modeLabelY + SectionLabelH
+	tabW := contentW / 2
+	p.modeTabs = []*Button{
+		{X: contentX, Y: modeTabY, W: tabW, H: TabHeight, Label: "vs Human",
+			OnClick: func() {
+				if p.game.GameMode() != ModeHumanVsHuman {
+					p.game.ToggleModeAction()
+				}
+			}},
+		{X: contentX + tabW, Y: modeTabY, W: tabW, H: TabHeight, Label: "vs Computer",
+			OnClick: func() {
+				if p.game.GameMode() != ModeHumanVsComputer {
+					p.game.ToggleModeAction()
+				}
+			}},
+	}
+
+	// Difficulty section: label + tabs (only visible in vs Computer mode)
+	diffLabelY := modeTabY + TabHeight + SectionSpacing
+	diffTabY := diffLabelY + SectionLabelH
+	diffTabW := contentW / 3
+	p.diffTabs = []*Button{
+		{X: contentX, Y: diffTabY, W: diffTabW, H: TabHeight - 2, Label: "Easy",
+			OnClick: func() { p.game.SetDifficulty(DifficultyEasy) }},
+		{X: contentX + diffTabW, Y: diffTabY, W: diffTabW, H: TabHeight - 2, Label: "Medium",
+			OnClick: func() { p.game.SetDifficulty(DifficultyMedium) }},
+		{X: contentX + diffTabW*2, Y: diffTabY, W: diffTabW, H: TabHeight - 2, Label: "Hard",
+			OnClick: func() { p.game.SetDifficulty(DifficultyHard) }},
+	}
 }
 
 // HandleInput processes input for the panel. Returns true if input was handled.
 func (p *Panel) HandleInput(input *InputHandler) bool {
 	mx, my := input.MousePosition()
 
-	// Update button hover states
-	for _, btn := range p.buttons {
-		btn.hovered = mx >= btn.X && mx < btn.X+btn.W && my >= btn.Y && my < btn.Y+btn.H
+	// Always check collapse button
+	p.collapseBtn.hovered = p.isInside(mx, my, p.collapseBtn)
+	if input.IsLeftJustPressed() && p.collapseBtn.hovered {
+		p.collapseBtn.OnClick() // toggleCollapse handles button recreation and window resize
+		return true
 	}
-	for _, btn := range p.diffButtons {
-		btn.hovered = mx >= btn.X && mx < btn.X+btn.W && my >= btn.Y && my < btn.Y+btn.H
+
+	if p.collapsed {
+		return false
+	}
+
+	// Check other buttons
+	p.newGameBtn.hovered = p.isInside(mx, my, p.newGameBtn)
+	for _, btn := range p.modeTabs {
+		btn.hovered = p.isInside(mx, my, btn)
+	}
+	for _, btn := range p.diffTabs {
+		btn.hovered = p.isInside(mx, my, btn)
 	}
 
 	// Handle clicks
 	if input.IsLeftJustPressed() {
-		for _, btn := range p.buttons {
-			if btn.hovered && btn.OnClick != nil {
+		if p.newGameBtn.hovered {
+			p.newGameBtn.OnClick()
+			return true
+		}
+		for _, btn := range p.modeTabs {
+			if btn.hovered {
 				btn.OnClick()
 				return true
 			}
 		}
-		for _, btn := range p.diffButtons {
-			if btn.hovered && btn.OnClick != nil {
-				btn.OnClick()
-				return true
+		if p.game.GameMode() == ModeHumanVsComputer {
+			for _, btn := range p.diffTabs {
+				if btn.hovered {
+					btn.OnClick()
+					return true
+				}
 			}
 		}
 	}
@@ -98,102 +192,213 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 	return false
 }
 
+func (p *Panel) isInside(mx, my int, btn *Button) bool {
+	return mx >= btn.X && mx < btn.X+btn.W && my >= btn.Y && my < btn.Y+btn.H
+}
+
 // Draw renders the panel.
 func (p *Panel) Draw(screen *ebiten.Image, r *Renderer) {
-	theme := r.Theme()
+	panelX := float32(BoardSize)
+
+	if p.collapsed {
+		// Draw collapsed state - just a thin bar with expand button
+		vector.DrawFilledRect(screen, panelX, 0, float32(CollapsedWidth), float32(ScreenHeight), panelBg, false)
+		p.drawCollapseButton(screen, true)
+		return
+	}
 
 	// Draw panel background
-	vector.DrawFilledRect(screen, float32(BoardSize), 0, float32(PanelWidth), float32(ScreenHeight), theme.Background, false)
+	vector.DrawFilledRect(screen, panelX, 0, float32(PanelWidth), float32(ScreenHeight), panelBg, false)
 
-	// Draw buttons
-	for _, btn := range p.buttons {
-		p.drawButton(screen, btn, theme)
-	}
+	// Draw collapse button
+	p.drawCollapseButton(screen, false)
 
-	// Update mode button label
-	if p.game.GameMode() == ModeHumanVsHuman {
-		p.buttons[1].Label = "vs Human"
-	} else {
-		p.buttons[1].Label = "vs Computer"
-	}
+	// Draw New Game button
+	p.drawPrimaryButton(screen, p.newGameBtn)
 
-	// Draw difficulty buttons (only show in vs Computer mode)
+	// Draw mode section
+	modeLabelY := p.modeTabs[0].Y - SectionLabelH
+	p.drawSectionLabel(screen, "Game Mode", BoardSize+PanelPadding, modeLabelY)
+	p.drawModeTabs(screen)
+
+	// Draw difficulty section (only in vs Computer mode)
 	if p.game.GameMode() == ModeHumanVsComputer {
-		for i, btn := range p.diffButtons {
-			btn.active = Difficulty(i) == p.game.Difficulty()
-			p.drawButton(screen, btn, theme)
-		}
+		diffLabelY := p.diffTabs[0].Y - SectionLabelH
+		p.drawSectionLabel(screen, "Difficulty", BoardSize+PanelPadding, diffLabelY)
+		p.drawDifficultyTabs(screen)
 	}
 
-	// Draw move history title
-	titleY := 130
-	p.drawText(screen, "Move History", BoardSize+20, titleY, theme.TextColor)
+	// Draw move history section
+	historyY := p.getHistoryStartY()
+	p.drawSectionLabel(screen, "Moves", BoardSize+PanelPadding, historyY)
+	p.drawMoveHistory(screen, historyY+SectionLabelH+4)
 
-	// Draw moves
-	p.drawMoveHistory(screen, r, titleY+30)
-
-	// Draw game status
-	if p.game.GameOver() {
-		p.drawText(screen, p.game.GameResult(), BoardSize+20, ScreenHeight-60, color.RGBA{255, 200, 0, 255})
-	} else if p.game.IsAIThinking() {
-		p.drawText(screen, "AI thinking...", BoardSize+20, ScreenHeight-60, color.RGBA{150, 200, 255, 255})
-	} else {
-		turn := "White to move"
-		if p.game.Position().SideToMove == 1 {
-			turn = "Black to move"
-		}
-		p.drawText(screen, turn, BoardSize+20, ScreenHeight-60, theme.TextColor)
-	}
+	// Draw status bar at bottom
+	p.drawStatusBar(screen)
 }
 
-// drawButton draws a button.
-func (p *Panel) drawButton(screen *ebiten.Image, btn *Button, theme *Theme) {
-	var bgColor color.RGBA
-	if btn.active {
-		bgColor = color.RGBA{100, 150, 100, 255} // Green for active
-	} else if btn.hovered {
-		bgColor = theme.ButtonHover
-	} else {
-		bgColor = theme.ButtonColor
+func (p *Panel) getHistoryStartY() int {
+	if p.game.GameMode() == ModeHumanVsComputer {
+		return p.diffTabs[0].Y + p.diffTabs[0].H + SectionSpacing - 4
+	}
+	return p.modeTabs[0].Y + p.modeTabs[0].H + SectionSpacing - 4
+}
+
+func (p *Panel) drawCollapseButton(screen *ebiten.Image, expand bool) {
+	btn := p.collapseBtn
+	bgColor := collapseButtonC
+	if btn.hovered {
+		bgColor = buttonHoverBg
 	}
 
-	// Draw background
+	// Draw rounded rect
 	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
 
-	// Draw border
-	vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 2, theme.TextColor, false)
-
-	// Draw label (centered)
-	centerX := btn.X + btn.W/2
-	centerY := btn.Y + btn.H/2
-	p.drawTextCentered(screen, btn.Label, centerX, centerY, theme.TextColor)
+	// Draw arrow icon
+	arrow := "‹"
+	if expand {
+		arrow = "›"
+	}
+	p.drawTextCentered(screen, arrow, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
 }
 
-// drawMoveHistory draws the move history list.
-func (p *Panel) drawMoveHistory(screen *ebiten.Image, r *Renderer, startY int) {
-	theme := r.Theme()
-	moves := p.game.SANHistory()
+func (p *Panel) drawPrimaryButton(screen *ebiten.Image, btn *Button) {
+	bgColor := accentColor
+	if btn.hovered {
+		bgColor = color.RGBA{96, 195, 140, 255} // Lighter green on hover
+	}
 
+	// Draw button with rounded corners (approximated with filled rect)
+	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+	// Draw label
+	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
+}
+
+func (p *Panel) drawModeTabs(screen *ebiten.Image) {
+	for i, btn := range p.modeTabs {
+		isActive := (i == 0 && p.game.GameMode() == ModeHumanVsHuman) ||
+			(i == 1 && p.game.GameMode() == ModeHumanVsComputer)
+
+		bgColor := tabInactiveBg
+		if isActive {
+			bgColor = tabActiveBg
+		} else if btn.hovered {
+			bgColor = tabHoverBg
+		}
+
+		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+		textColor := textSecondary
+		if isActive {
+			textColor = textPrimary
+		}
+		p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textColor)
+	}
+}
+
+func (p *Panel) drawDifficultyTabs(screen *ebiten.Image) {
+	for i, btn := range p.diffTabs {
+		isActive := Difficulty(i) == p.game.Difficulty()
+
+		bgColor := tabInactiveBg
+		if isActive {
+			bgColor = tabActiveBg
+		} else if btn.hovered {
+			bgColor = tabHoverBg
+		}
+
+		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+		textColor := textSecondary
+		if isActive {
+			textColor = textPrimary
+		}
+		p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textColor)
+	}
+}
+
+func (p *Panel) drawSectionLabel(screen *ebiten.Image, label string, x, y int) {
+	p.drawText(screen, label, x, y, textMuted)
+}
+
+func (p *Panel) drawMoveHistory(screen *ebiten.Image, startY int) {
+	moves := p.game.SANHistory()
+	if len(moves) == 0 {
+		p.drawText(screen, "No moves yet", BoardSize+PanelPadding, startY+5, textMuted)
+		return
+	}
+
+	x := BoardSize + PanelPadding
 	y := startY
-	maxY := ScreenHeight - 100
+	rowHeight := 22
+	maxY := ScreenHeight - 70 // Leave room for status bar
 
 	for i := 0; i < len(moves); i += 2 {
 		if y > maxY {
+			// Show "more moves" indicator
+			remaining := (len(moves) - i) / 2
+			if (len(moves)-i)%2 != 0 {
+				remaining++
+			}
+			p.drawText(screen, fmt.Sprintf("... +%d more", remaining), x, y, textMuted)
 			break
 		}
 
-		moveNum := (i / 2) + 1
-		line := fmt.Sprintf("%d. %s", moveNum, moves[i])
-		if i+1 < len(moves) {
-			line += fmt.Sprintf("  %s", moves[i+1])
+		// Alternating row background
+		if (i/2)%2 == 1 {
+			vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding-4), float32(y-2),
+				float32(PanelWidth-PanelPadding*2+8), float32(rowHeight), moveRowAlt, false)
 		}
 
-		p.drawText(screen, line, BoardSize+20, y, theme.TextColor)
-		y += 20
+		moveNum := (i / 2) + 1
+
+		// Move number
+		numStr := fmt.Sprintf("%d.", moveNum)
+		p.drawText(screen, numStr, x, y, textMuted)
+
+		// White's move
+		p.drawText(screen, moves[i], x+30, y, textPrimary)
+
+		// Black's move (if exists)
+		if i+1 < len(moves) {
+			p.drawText(screen, moves[i+1], x+100, y, textPrimary)
+		}
+
+		y += rowHeight
 	}
 }
 
-// drawText draws text at the given position using proper font rendering.
+func (p *Panel) drawStatusBar(screen *ebiten.Image) {
+	statusY := ScreenHeight - 50
+	x := BoardSize + PanelPadding
+
+	// Draw divider
+	vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding), float32(statusY-10),
+		float32(PanelWidth-PanelPadding*2), 1, dividerColor, false)
+
+	var statusText string
+	var statusColor color.RGBA
+
+	if p.game.GameOver() {
+		statusText = p.game.GameResult()
+		statusColor = statusGameOver
+	} else if p.game.IsAIThinking() {
+		statusText = "● AI thinking..."
+		statusColor = statusThinking
+	} else {
+		if p.game.Position().SideToMove == 0 {
+			statusText = "○ White to move"
+		} else {
+			statusText = "● Black to move"
+		}
+		statusColor = textPrimary
+	}
+
+	p.drawText(screen, statusText, x, statusY+5, statusColor)
+}
+
+// Text drawing helpers
 func (p *Panel) drawText(screen *ebiten.Image, s string, x, y int, c color.Color) {
 	face := GetRegularFace()
 	if face == nil {
@@ -205,7 +410,6 @@ func (p *Panel) drawText(screen *ebiten.Image, s string, x, y int, c color.Color
 	text.Draw(screen, s, face, op)
 }
 
-// drawTextCentered draws text centered at the given position.
 func (p *Panel) drawTextCentered(screen *ebiten.Image, s string, centerX, centerY int, c color.Color) {
 	face := GetRegularFace()
 	if face == nil {
@@ -218,4 +422,22 @@ func (p *Panel) drawTextCentered(screen *ebiten.Image, s string, centerX, center
 	op.GeoM.Translate(x, y)
 	op.ColorScale.ScaleWithColor(c)
 	text.Draw(screen, s, face, op)
+}
+
+// Collapsed returns whether the panel is collapsed.
+func (p *Panel) Collapsed() bool {
+	return p.collapsed
+}
+
+// toggleCollapse toggles the panel collapsed state and resizes the window.
+func (p *Panel) toggleCollapse() {
+	p.collapsed = !p.collapsed
+	p.createButtons()
+
+	// Resize window to match new layout
+	if p.collapsed {
+		ebiten.SetWindowSize(BoardSize+CollapsedWidth, ScreenHeight)
+	} else {
+		ebiten.SetWindowSize(ScreenWidth, ScreenHeight)
+	}
 }

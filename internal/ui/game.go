@@ -11,7 +11,7 @@ import (
 // UI Constants
 const (
 	ScreenWidth  = 960
-	ScreenHeight = 720
+	ScreenHeight = 640 // Match board height to eliminate unused space
 	BoardSize    = 640
 	SquareSize   = BoardSize / 8
 	PanelWidth   = ScreenWidth - BoardSize
@@ -147,7 +147,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 }
 
 // Layout returns the game's screen dimensions.
+// Width is dynamic based on panel collapsed state.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
+	if g.panel != nil && g.panel.Collapsed() {
+		return BoardSize + CollapsedWidth, ScreenHeight
+	}
 	return ScreenWidth, ScreenHeight
 }
 
@@ -405,9 +409,7 @@ func (g *Game) startAIThinking() {
 
 	go func() {
 		move := g.engine.Search(pos)
-		if move != board.NoMove {
-			g.aiMove <- move
-		}
+		g.aiMove <- move // Always send, even if NoMove (game over)
 	}()
 }
 
@@ -420,6 +422,11 @@ func (g *Game) checkAIMove() {
 	select {
 	case move := <-g.aiMove:
 		g.aiThinking = false
+		if move == board.NoMove {
+			// AI has no valid move - game should be over (checkmate/stalemate)
+			g.checkGameEnd()
+			return
+		}
 		g.makeMove(move)
 	default:
 		// Still thinking
