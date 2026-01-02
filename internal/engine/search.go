@@ -29,6 +29,12 @@ const (
 // At depth d, prune quiet moves after lmpThreshold[d] moves
 var lmpThreshold = [8]int{0, 3, 5, 9, 15, 23, 33, 45}
 
+// Threat extension constants
+const (
+	threatExtensionMinDepth  = 4   // Minimum depth to consider threat extensions
+	threatExtensionThreshold = 200 // Minimum material value to trigger extension (Knight/Bishop value)
+)
+
 // PVTable stores the principal variation.
 type PVTable struct {
 	length [MaxPly]int
@@ -220,6 +226,13 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 	extension := 0
 	if inCheck {
 		extension = 1
+	}
+
+	// Threat extension: extend when opponent has serious threats
+	if extension == 0 && depth >= threatExtensionMinDepth && ply > 0 {
+		if s.detectSeriousThreats() {
+			extension = 1
+		}
 	}
 
 	// Static evaluation for pruning decisions
@@ -817,5 +830,64 @@ func (s *Searcher) isExcludedRootMove(move board.Move) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// detectSeriousThreats checks if opponent has serious threats against our pieces.
+// Returns true if high-value pieces are attacked and cannot be adequately defended.
+func (s *Searcher) detectSeriousThreats() bool {
+	pos := s.pos
+	us := pos.SideToMove
+	them := us.Other()
+	occupied := pos.AllOccupied
+
+	// Compute enemy attack map
+	enemyPawnAttacks := computePawnAttacksBB(pos, them)
+	enemyKnightAttacks := computeKnightAttacksBB(pos, them)
+	enemyBishopAttacks := computeBishopAttacksBB(pos, them, occupied)
+	enemyRookAttacks := computeRookAttacksBB(pos, them, occupied)
+	enemyQueenAttacks := computeQueenAttacksBB(pos, them, occupied)
+
+	enemyAttacks := enemyPawnAttacks | enemyKnightAttacks | enemyBishopAttacks |
+		enemyRookAttacks | enemyQueenAttacks
+
+	// Compute our defense map
+	ourPawnAttacks := computePawnAttacksBB(pos, us)
+	ourKnightAttacks := computeKnightAttacksBB(pos, us)
+	ourBishopAttacks := computeBishopAttacksBB(pos, us, occupied)
+	ourRookAttacks := computeRookAttacksBB(pos, us, occupied)
+	ourQueenAttacks := computeQueenAttacksBB(pos, us, occupied)
+	ourKingAttacks := board.KingAttacks(pos.KingSquare[us])
+
+	ourDefenses := ourPawnAttacks | ourKnightAttacks | ourBishopAttacks |
+		ourRookAttacks | ourQueenAttacks | ourKingAttacks
+
+	// Check for attacked pieces (excluding king)
+	ourPieces := pos.Occupied[us] &^ board.SquareBB(pos.KingSquare[us])
+
+	// Hanging pieces: attacked but not defended
+	hangingPieces := ourPieces & enemyAttacks & ^ourDefenses
+
+	// Check if any hanging piece is worth extending for
+	for hangingPieces != 0 {
+		sq := hangingPieces.PopLSB()
+		piece := pos.PieceAt(sq)
+		if piece != board.NoPiece && pieceValues[piece.Type()] >= threatExtensionThreshold {
+			return true
+		}
+	}
+
+	// Also check for pieces attacked by lower-value attackers (even if defended)
+	// e.g., queen attacked by bishop
+	queens := pos.Pieces[us][board.Queen]
+	if queens&(enemyPawnAttacks|enemyKnightAttacks|enemyBishopAttacks|enemyRookAttacks) != 0 {
+		return true
+	}
+
+	rooks := pos.Pieces[us][board.Rook]
+	if rooks&(enemyPawnAttacks|enemyKnightAttacks|enemyBishopAttacks) != 0 {
+		return true
+	}
+
 	return false
 }

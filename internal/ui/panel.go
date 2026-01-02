@@ -15,9 +15,9 @@ const (
 	SectionSpacing  = 28
 	ButtonHeight    = 40
 	TabHeight       = 34
-	CollapsedWidth  = 36
-	CollapseButtonW = 28
-	CollapseButtonH = 80
+	CollapsedWidth  = 24
+	CollapseButtonW = 20
+	CollapseButtonH = 32
 	SectionLabelH   = 20
 )
 
@@ -59,6 +59,7 @@ type Panel struct {
 	// UI elements
 	collapseBtn *Button
 	newGameBtn  *Button
+	settingsBtn *Button
 	modeTabs    []*Button // [0] = vs Human, [1] = vs Computer
 	diffTabs    []*Button // [0] = Easy, [1] = Medium, [2] = Hard
 
@@ -80,26 +81,26 @@ func NewPanel(g *Game) *Panel {
 
 // createButtons initializes all panel buttons.
 func (p *Panel) createButtons() {
-	// Collapse/expand button (on right edge of panel, or centered when collapsed)
+	// Collapse/expand button (top-right corner, small)
 	if p.collapsed {
 		p.collapseBtn = &Button{
-			X: BoardSize + (CollapsedWidth-CollapseButtonW)/2,
-			Y: (ScreenHeight - CollapseButtonH) / 2,
+			X: BoardSize + 2,
+			Y: 4,
 			W: CollapseButtonW, H: CollapseButtonH,
 			OnClick: func() { p.toggleCollapse() },
 		}
 	} else {
 		p.collapseBtn = &Button{
 			X: BoardSize + PanelWidth - CollapseButtonW - 4,
-			Y: (ScreenHeight - CollapseButtonH) / 2,
+			Y: 4,
 			W: CollapseButtonW, H: CollapseButtonH,
 			OnClick: func() { p.toggleCollapse() },
 		}
 	}
 
-	// Content area
+	// Content area - full width, collapse button doesn't take space
 	contentX := BoardSize + PanelPadding
-	contentW := PanelWidth - PanelPadding*2 - CollapseButtonW
+	contentW := PanelWidth - PanelPadding*2
 
 	// New Game button (full width, prominent)
 	newGameY := PanelPadding + 8
@@ -110,8 +111,17 @@ func (p *Panel) createButtons() {
 		OnClick: p.game.NewGameAction,
 	}
 
+	// Settings button (below New Game)
+	settingsY := newGameY + ButtonHeight + 8
+	p.settingsBtn = &Button{
+		X: contentX, Y: settingsY,
+		W: contentW, H: ButtonHeight - 6,
+		Label:   "Settings",
+		OnClick: p.game.ShowSettings,
+	}
+
 	// Mode section: label + tabs
-	modeLabelY := newGameY + ButtonHeight + SectionSpacing
+	modeLabelY := settingsY + ButtonHeight - 6 + SectionSpacing - 8
 	modeTabY := modeLabelY + SectionLabelH
 	tabW := contentW / 2
 	p.modeTabs = []*Button{
@@ -158,8 +168,25 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 		return false
 	}
 
+	// Handle scroll wheel for move history
+	_, wheelY := ebiten.Wheel()
+	if wheelY != 0 {
+		historyY := p.getHistoryStartY()
+		// Check if mouse is in move history area
+		if mx >= BoardSize && my >= historyY && my < ScreenHeight-70 {
+			p.scrollY -= int(wheelY * 30) // 30px per scroll tick
+			if p.scrollY < 0 {
+				p.scrollY = 0
+			}
+			if p.scrollY > p.maxScrollY {
+				p.scrollY = p.maxScrollY
+			}
+		}
+	}
+
 	// Check other buttons
 	p.newGameBtn.hovered = p.isInside(mx, my, p.newGameBtn)
+	p.settingsBtn.hovered = p.isInside(mx, my, p.settingsBtn)
 	for _, btn := range p.modeTabs {
 		btn.hovered = p.isInside(mx, my, btn)
 	}
@@ -171,6 +198,10 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 	if input.IsLeftJustPressed() {
 		if p.newGameBtn.hovered {
 			p.newGameBtn.OnClick()
+			return true
+		}
+		if p.settingsBtn.hovered {
+			p.settingsBtn.OnClick()
 			return true
 		}
 		for _, btn := range p.modeTabs {
@@ -215,6 +246,9 @@ func (p *Panel) Draw(screen *ebiten.Image, r *Renderer) {
 
 	// Draw New Game button
 	p.drawPrimaryButton(screen, p.newGameBtn)
+
+	// Draw Settings button
+	p.drawSecondaryButton(screen, p.settingsBtn)
 
 	// Draw mode section
 	modeLabelY := p.modeTabs[0].Y - SectionLabelH
@@ -275,6 +309,16 @@ func (p *Panel) drawPrimaryButton(screen *ebiten.Image, btn *Button) {
 	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
 }
 
+func (p *Panel) drawSecondaryButton(screen *ebiten.Image, btn *Button) {
+	bgColor := buttonBg
+	if btn.hovered {
+		bgColor = buttonHoverBg
+	}
+
+	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textSecondary)
+}
+
 func (p *Panel) drawModeTabs(screen *ebiten.Image) {
 	for i, btn := range p.modeTabs {
 		isActive := (i == 0 && p.game.GameMode() == ModeHumanVsHuman) ||
@@ -330,53 +374,104 @@ func (p *Panel) drawMoveHistory(screen *ebiten.Image, startY int) {
 	}
 
 	x := BoardSize + PanelPadding
-	y := startY
 	rowHeight := 22
 	maxY := ScreenHeight - 70 // Leave room for status bar
+	visibleHeight := maxY - startY
 
-	for i := 0; i < len(moves); i += 2 {
+	// Calculate total content height and max scroll
+	totalRows := (len(moves) + 1) / 2
+	contentHeight := totalRows * rowHeight
+	p.maxScrollY = contentHeight - visibleHeight
+	if p.maxScrollY < 0 {
+		p.maxScrollY = 0
+	}
+
+	// Clamp scroll position
+	if p.scrollY > p.maxScrollY {
+		p.scrollY = p.maxScrollY
+	}
+
+	// Calculate starting row based on scroll
+	startRow := p.scrollY / rowHeight
+	startMoveIdx := startRow * 2
+
+	// Y position adjusted for partial scroll
+	y := startY - (p.scrollY % rowHeight)
+
+	for i := startMoveIdx; i < len(moves); i += 2 {
+		// Skip if above visible area
+		if y < startY-rowHeight {
+			y += rowHeight
+			continue
+		}
+		// Stop if below visible area
 		if y > maxY {
-			// Show "more moves" indicator
-			remaining := (len(moves) - i) / 2
-			if (len(moves)-i)%2 != 0 {
-				remaining++
-			}
-			p.drawText(screen, fmt.Sprintf("... +%d more", remaining), x, y, textMuted)
 			break
 		}
 
-		// Alternating row background
-		if (i/2)%2 == 1 {
-			vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding-4), float32(y-2),
+		// Alternating row background (only if visible)
+		if y >= startY-rowHeight && (i/2)%2 == 1 {
+			bgY := y - 2
+			if bgY < startY {
+				bgY = startY
+			}
+			vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding-4), float32(bgY),
 				float32(PanelWidth-PanelPadding*2+8), float32(rowHeight), moveRowAlt, false)
 		}
 
-		moveNum := (i / 2) + 1
-
-		// Move number
-		numStr := fmt.Sprintf("%d.", moveNum)
-		p.drawText(screen, numStr, x, y, textMuted)
-
-		// White's move
-		p.drawText(screen, moves[i], x+30, y, textPrimary)
-
-		// Black's move (if exists)
-		if i+1 < len(moves) {
-			p.drawText(screen, moves[i+1], x+100, y, textPrimary)
+		// Only draw text if within visible bounds
+		if y >= startY {
+			moveNum := (i / 2) + 1
+			numStr := fmt.Sprintf("%d.", moveNum)
+			p.drawText(screen, numStr, x, y, textMuted)
+			p.drawText(screen, moves[i], x+30, y, textPrimary)
+			if i+1 < len(moves) {
+				p.drawText(screen, moves[i+1], x+100, y, textPrimary)
+			}
 		}
 
 		y += rowHeight
 	}
+
+	// Show scroll indicator if there's more content
+	if p.maxScrollY > 0 {
+		// Draw a small scroll indicator on the right
+		scrollPct := float32(p.scrollY) / float32(p.maxScrollY)
+		indicatorH := float32(visibleHeight) * float32(visibleHeight) / float32(contentHeight)
+		if indicatorH < 20 {
+			indicatorH = 20
+		}
+		indicatorY := float32(startY) + scrollPct*(float32(visibleHeight)-indicatorH)
+		indicatorX := float32(BoardSize + PanelWidth - 8)
+		vector.DrawFilledRect(screen, indicatorX, indicatorY, 4, indicatorH, textMuted, false)
+	}
 }
 
 func (p *Panel) drawStatusBar(screen *ebiten.Image) {
-	statusY := ScreenHeight - 50
+	statusY := ScreenHeight - 70
 	x := BoardSize + PanelPadding
 
 	// Draw divider
 	vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding), float32(statusY-10),
 		float32(PanelWidth-PanelPadding*2), 1, dividerColor, false)
 
+	// Draw player name and eval mode
+	username := p.game.Username()
+	if len(username) > 12 {
+		username = username[:12] + "..."
+	}
+	p.drawText(screen, username, x, statusY, textPrimary)
+
+	// Eval mode badge
+	evalMode := "Classical"
+	evalColor := textSecondary
+	if p.game.EvalMode() == EvalNNUE {
+		evalMode = "NNUE"
+		evalColor = accentColor
+	}
+	p.drawText(screen, evalMode, x+130, statusY, evalColor)
+
+	// Game status
 	var statusText string
 	var statusColor color.RGBA
 
@@ -384,18 +479,18 @@ func (p *Panel) drawStatusBar(screen *ebiten.Image) {
 		statusText = p.game.GameResult()
 		statusColor = statusGameOver
 	} else if p.game.IsAIThinking() {
-		statusText = "● AI thinking..."
+		statusText = "AI thinking..."
 		statusColor = statusThinking
 	} else {
 		if p.game.Position().SideToMove == 0 {
-			statusText = "○ White to move"
+			statusText = "White to move"
 		} else {
-			statusText = "● Black to move"
+			statusText = "Black to move"
 		}
 		statusColor = textPrimary
 	}
 
-	p.drawText(screen, statusText, x, statusY+5, statusColor)
+	p.drawText(screen, statusText, x, statusY+22, statusColor)
 }
 
 // Text drawing helpers

@@ -87,6 +87,93 @@ const (
 	loosePiecePenalty   = -10 // Undefended piece (potential target)
 )
 
+// King tropism weights per piece type (bonus for proximity to enemy king)
+var tropismWeight = [6]int{0, 3, 2, 2, 5, 0} // Pawn, Knight, Bishop, Rook, Queen, King
+
+// Passed pawn king distance bonus table
+var kingDistanceBonus = [8]int{0, 0, 10, 20, 30, 40, 50, 60}
+
+const passedPawnUnstoppableBonus = 200 // Pawn cannot be caught by enemy king
+
+// Piece coordination constants
+const (
+	// Rooks on 7th rank
+	rookOn7thMg          = 30
+	rookOn7thEg          = 40
+	rookOn7thWithPawnsMg = 15 // Extra bonus if enemy has pawns on 2nd rank
+	rookOn7thWithPawnsEg = 20
+	doubleRooksOn7thMg   = 50 // Both rooks on 7th (pig rooks)
+	doubleRooksOn7thEg   = 60
+
+	// Connected rooks (defending each other)
+	connectedRooksMg = 10
+	connectedRooksEg = 15
+
+	// Doubled rooks on file
+	doubledRooksOnFileMg = 20
+	doubledRooksOnFileEg = 25
+)
+
+// Space evaluation constants
+const (
+	spaceSquareBonus     = 2 // Per safe square in space zone controlled
+	spaceBehindPawnBonus = 3 // Extra bonus if behind our pawn chain
+	spaceMinPieces       = 3 // Minimum pieces to apply space evaluation
+)
+
+// Space zones for each side (central files, ranks 2-5 for white, 4-7 for black)
+var (
+	whiteSpaceZone = (board.FileC | board.FileD | board.FileE | board.FileF) &
+		(board.Rank2 | board.Rank3 | board.Rank4 | board.Rank5)
+	blackSpaceZone = (board.FileC | board.FileD | board.FileE | board.FileF) &
+		(board.Rank4 | board.Rank5 | board.Rank6 | board.Rank7)
+)
+
+// Trapped piece penalties
+const (
+	// Bad bishop penalty (per blocking pawn on same color)
+	badBishopPenaltyMg = -5
+	badBishopPenaltyEg = -10
+
+	// Trapped bishop (on a6/h6/a3/h3 corners)
+	trappedBishopPenaltyMg = -80
+	trappedBishopPenaltyEg = -50
+
+	// Trapped rook (in corner by own king, no castling rights)
+	trappedRookPenaltyMg = -50
+	trappedRookPenaltyEg = -25
+
+	// Knight on rim penalties
+	knightRimPenaltyMg    = -15 // On rim with 3 or fewer moves
+	knightRimPenaltyEg    = -10
+	knightCornerPenaltyMg = -30 // On corner squares
+	knightCornerPenaltyEg = -20
+)
+
+// Light and dark square masks
+var (
+	lightSquares board.Bitboard // Squares where file+rank is odd (a1 is dark)
+	darkSquares  board.Bitboard // Squares where file+rank is even
+)
+
+// Rim and corner masks for knights
+var (
+	rimSquares    = board.FileA | board.FileH | board.Rank1 | board.Rank8
+	cornerSquares = board.SquareBB(board.A1) | board.SquareBB(board.H1) |
+		board.SquareBB(board.A8) | board.SquareBB(board.H8)
+)
+
+func init() {
+	// Initialize light/dark square masks
+	for sq := board.A1; sq <= board.H8; sq++ {
+		if (sq.File()+sq.Rank())%2 == 1 {
+			lightSquares |= board.SquareBB(sq)
+		} else {
+			darkSquares |= board.SquareBB(sq)
+		}
+	}
+}
+
 // Piece-Square Tables (PST) for positional evaluation
 // Values are from White's perspective; mirrored for Black
 
@@ -242,6 +329,10 @@ func Evaluate(pos *board.Position) int {
 	kingSafety := evaluateKingSafety(pos)
 	mgScore += kingSafety
 
+	// King tropism (pieces approaching enemy king)
+	tropism := evaluateKingTropism(pos)
+	mgScore += tropism
+
 	// Bishop pair bonus
 	bpMg, bpEg := evaluateBishopPair(pos)
 	mgScore += bpMg
@@ -251,6 +342,11 @@ func Evaluate(pos *board.Position) int {
 	rfMg, rfEg := evaluateRooksOnFiles(pos)
 	mgScore += rfMg
 	egScore += rfEg
+
+	// Piece coordination (rooks on 7th, connected rooks)
+	coordMg, coordEg := evaluatePieceCoordination(pos)
+	mgScore += coordMg
+	egScore += coordEg
 
 	// Pawn structure (doubled, isolated, backward)
 	psMg, psEg := evaluatePawnStructure(pos)
@@ -266,6 +362,15 @@ func Evaluate(pos *board.Position) int {
 	thrMg, thrEg := evaluateThreats(pos)
 	mgScore += thrMg
 	egScore += thrEg
+
+	// Space evaluation (middlegame only)
+	spaceScore := evaluateSpace(pos)
+	mgScore += spaceScore
+
+	// Trapped pieces evaluation
+	tpMg, tpEg := evaluateTrappedPieces(pos)
+	mgScore += tpMg
+	egScore += tpEg
 
 	// Tapered evaluation (interpolate between middlegame and endgame)
 	// Maximum phase = 2*4 + 2*1 + 2*1 + 2*2 = 16 per side = 32 total
@@ -450,6 +555,11 @@ func evaluatePassedPawns(pos *board.Position) (mgBonus, egBonus int) {
 
 		pawns := pos.Pieces[color][board.Pawn]
 		friendlyPawns := pawns
+		enemy := color.Other()
+
+		// Get king positions for distance calculations
+		friendlyKingSq := pos.KingSquare[color]
+		enemyKingSq := pos.KingSquare[enemy]
 
 		for pawns != 0 {
 			sq := pawns.PopLSB()
@@ -460,9 +570,28 @@ func evaluatePassedPawns(pos *board.Position) (mgBonus, egBonus int) {
 
 			// Get relative rank (0-7 from pawn's perspective)
 			relRank := sq.RelativeRank(color)
+			file := sq.File()
 
 			// Base bonus by rank
 			bonus := passedPawnBonus[relRank]
+			egBonusExtra := 0
+
+			// --- King Distance Evaluation (endgame) ---
+			// Calculate promotion square
+			var promoSq board.Square
+			if color == board.White {
+				promoSq = board.NewSquare(file, 7)
+			} else {
+				promoSq = board.NewSquare(file, 0)
+			}
+
+			// Friendly king close to pawn is good (can support)
+			friendlyKingDist := chebyshevDistance(friendlyKingSq, sq)
+			egBonusExtra += kingDistanceBonus[7-minInt(friendlyKingDist, 7)]
+
+			// Enemy king far from promotion square is good
+			enemyKingDistToPromo := chebyshevDistance(enemyKingSq, promoSq)
+			egBonusExtra += kingDistanceBonus[minInt(enemyKingDistToPromo, 7)]
 
 			// Check if protected by own pawn
 			pawnAttackers := board.PawnAttacks(sq, color.Other()) & friendlyPawns
@@ -471,7 +600,6 @@ func evaluatePassedPawns(pos *board.Position) (mgBonus, egBonus int) {
 			}
 
 			// Check for connected passed pawns (adjacent file)
-			file := sq.File()
 			var adjacentFiles board.Bitboard
 			if file > 0 {
 				adjacentFiles |= board.FileMask[file-1]
@@ -496,13 +624,32 @@ func evaluatePassedPawns(pos *board.Position) (mgBonus, egBonus int) {
 				frontSquares = board.SquareBB(sq).SouthFill() &^ board.SquareBB(sq)
 			}
 			frontSquares &= board.FileMask[file] // Only check same file
-			if (frontSquares & pos.AllOccupied) == 0 {
+			pathClear := (frontSquares & pos.AllOccupied) == 0
+			if pathClear {
 				bonus += passedPawnFreePathBonus
+			}
+
+			// --- Unstoppable Passed Pawn Detection ---
+			// A pawn is unstoppable if enemy king cannot catch it
+			if pathClear && relRank >= 4 { // Only check advanced pawns
+				squaresToPromo := 7 - relRank
+				enemyKingDistToPawn := chebyshevDistance(enemyKingSq, sq)
+
+				// With the move, pawn can advance; enemy king needs to catch up
+				tempoBonus := 0
+				if pos.SideToMove == color {
+					tempoBonus = 1
+				}
+
+				// Pawn is unstoppable if king can't reach path in time
+				if enemyKingDistToPawn > squaresToPromo+1-tempoBonus {
+					egBonusExtra += passedPawnUnstoppableBonus
+				}
 			}
 
 			// Endgame bonus is higher (passed pawns more valuable in endgame)
 			mgBonus += sign * bonus
-			egBonus += sign * (bonus * 3 / 2) // 50% higher in endgame
+			egBonus += sign * (bonus*3/2 + egBonusExtra)
 		}
 	}
 
@@ -1244,4 +1391,385 @@ func computeQueenAttacksBB(pos *board.Position, color board.Color, occupied boar
 		attacks |= board.QueenAttacks(sq, occupied)
 	}
 	return attacks
+}
+
+// chebyshevDistance calculates the Chebyshev distance between two squares.
+// This is max(|file_diff|, |rank_diff|), representing king moves needed.
+func chebyshevDistance(sq1, sq2 board.Square) int {
+	f1, r1 := sq1.File(), sq1.Rank()
+	f2, r2 := sq2.File(), sq2.Rank()
+
+	fileDiff := f1 - f2
+	if fileDiff < 0 {
+		fileDiff = -fileDiff
+	}
+	rankDiff := r1 - r2
+	if rankDiff < 0 {
+		rankDiff = -rankDiff
+	}
+
+	if fileDiff > rankDiff {
+		return fileDiff
+	}
+	return rankDiff
+}
+
+// minInt returns the minimum of two integers.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// evaluateKingTropism calculates bonus for pieces approaching enemy king.
+// Returns middlegame score (tropism matters more in attacks).
+func evaluateKingTropism(pos *board.Position) int {
+	var score int
+
+	for color := board.White; color <= board.Black; color++ {
+		sign := 1
+		if color == board.Black {
+			sign = -1
+		}
+
+		enemy := color.Other()
+		enemyKingSq := pos.KingSquare[enemy]
+
+		// Calculate tropism for each piece type (Knights to Queens)
+		for pt := board.Knight; pt <= board.Queen; pt++ {
+			pieces := pos.Pieces[color][pt]
+			for pieces != 0 {
+				sq := pieces.PopLSB()
+				dist := chebyshevDistance(sq, enemyKingSq)
+
+				// Closer pieces get higher bonus (inverse relationship)
+				// Bonus = weight * (7 - distance)
+				if dist < 7 {
+					bonus := tropismWeight[pt] * (7 - dist)
+					score += sign * bonus
+				}
+			}
+		}
+	}
+
+	return score
+}
+
+// evaluatePieceCoordination evaluates piece coordination patterns.
+func evaluatePieceCoordination(pos *board.Position) (mgBonus, egBonus int) {
+	occupied := pos.AllOccupied
+
+	for color := board.White; color <= board.Black; color++ {
+		sign := 1
+		if color == board.Black {
+			sign = -1
+		}
+
+		enemy := color.Other()
+		rooks := pos.Pieces[color][board.Rook]
+
+		// --- Rooks on 7th Rank ---
+		var rank7th board.Bitboard
+		var enemyPawnRank board.Bitboard
+		if color == board.White {
+			rank7th = board.Rank7
+			enemyPawnRank = board.Rank2
+		} else {
+			rank7th = board.Rank2
+			enemyPawnRank = board.Rank7
+		}
+
+		rooksOn7th := rooks & rank7th
+		rooksOn7thCount := rooksOn7th.PopCount()
+
+		if rooksOn7thCount > 0 {
+			// Base bonus for rook(s) on 7th
+			mgBonus += sign * rookOn7thMg * rooksOn7thCount
+			egBonus += sign * rookOn7thEg * rooksOn7thCount
+
+			// Extra bonus if enemy has pawns on their 2nd rank
+			enemyPawnsOnRank := pos.Pieces[enemy][board.Pawn] & enemyPawnRank
+			if enemyPawnsOnRank != 0 {
+				mgBonus += sign * rookOn7thWithPawnsMg * rooksOn7thCount
+				egBonus += sign * rookOn7thWithPawnsEg * rooksOn7thCount
+			}
+
+			// Double rooks on 7th (pig rooks)
+			if rooksOn7thCount >= 2 {
+				mgBonus += sign * doubleRooksOn7thMg
+				egBonus += sign * doubleRooksOn7thEg
+			}
+		}
+
+		// --- Connected Rooks (defending each other) ---
+		rookCount := rooks.PopCount()
+		if rookCount >= 2 {
+			// Get all rook squares
+			tempRooks := rooks
+			var rookSquares [2]board.Square
+			idx := 0
+			for tempRooks != 0 && idx < 2 {
+				rookSquares[idx] = tempRooks.PopLSB()
+				idx++
+			}
+
+			if idx == 2 {
+				sq1, sq2 := rookSquares[0], rookSquares[1]
+				rookAttacks := board.RookAttacks(sq1, occupied)
+
+				// Check if rooks see each other (connected)
+				if rookAttacks.IsSet(sq2) {
+					mgBonus += sign * connectedRooksMg
+					egBonus += sign * connectedRooksEg
+
+					// Check if doubled on same file
+					if sq1.File() == sq2.File() {
+						mgBonus += sign * doubledRooksOnFileMg
+						egBonus += sign * doubledRooksOnFileEg
+					}
+				}
+			}
+		}
+	}
+
+	return mgBonus, egBonus
+}
+
+// evaluateSpace evaluates space control in the center.
+// Returns middlegame bonus only (space matters less in endgame).
+func evaluateSpace(pos *board.Position) int {
+	var score int
+
+	// Count pieces to determine if space evaluation is relevant
+	whitePieceCount := pos.Pieces[board.White][board.Knight].PopCount() +
+		pos.Pieces[board.White][board.Bishop].PopCount() +
+		pos.Pieces[board.White][board.Rook].PopCount() +
+		pos.Pieces[board.White][board.Queen].PopCount()
+	blackPieceCount := pos.Pieces[board.Black][board.Knight].PopCount() +
+		pos.Pieces[board.Black][board.Bishop].PopCount() +
+		pos.Pieces[board.Black][board.Rook].PopCount() +
+		pos.Pieces[board.Black][board.Queen].PopCount()
+
+	// Only evaluate space if both sides have enough pieces
+	if whitePieceCount < spaceMinPieces && blackPieceCount < spaceMinPieces {
+		return 0
+	}
+
+	for color := board.White; color <= board.Black; color++ {
+		sign := 1
+		if color == board.Black {
+			sign = -1
+		}
+
+		// Only evaluate if this side has enough pieces
+		pieceCount := whitePieceCount
+		if color == board.Black {
+			pieceCount = blackPieceCount
+		}
+		if pieceCount < spaceMinPieces {
+			continue
+		}
+
+		enemy := color.Other()
+		ownPawns := pos.Pieces[color][board.Pawn]
+		enemyPawns := pos.Pieces[enemy][board.Pawn]
+
+		// Select appropriate space zone
+		var spaceZone board.Bitboard
+		if color == board.White {
+			spaceZone = whiteSpaceZone
+		} else {
+			spaceZone = blackSpaceZone
+		}
+
+		// Compute squares we control in the space zone
+		// Pawn attacks
+		var pawnControl board.Bitboard
+		if color == board.White {
+			pawnControl = ownPawns.NorthEast() | ownPawns.NorthWest()
+		} else {
+			pawnControl = ownPawns.SouthEast() | ownPawns.SouthWest()
+		}
+
+		// Enemy pawn attacks (unsafe squares)
+		var enemyPawnAttacks board.Bitboard
+		if color == board.White {
+			enemyPawnAttacks = enemyPawns.SouthEast() | enemyPawns.SouthWest()
+		} else {
+			enemyPawnAttacks = enemyPawns.NorthEast() | enemyPawns.NorthWest()
+		}
+
+		// Safe space: space zone squares not attacked by enemy pawns
+		safeSpace := spaceZone &^ enemyPawnAttacks
+
+		// Squares behind our pawns (protected space)
+		var behindPawns board.Bitboard
+		if color == board.White {
+			behindPawns = ownPawns.SouthFill() // All squares behind white pawns
+		} else {
+			behindPawns = ownPawns.NorthFill() // All squares behind black pawns
+		}
+
+		// Count controlled space squares
+		controlledSpace := (pawnControl | behindPawns) & safeSpace
+		spaceCount := controlledSpace.PopCount()
+
+		// Bonus for space behind pawn chain
+		behindChainSpace := controlledSpace & behindPawns
+		behindCount := behindChainSpace.PopCount()
+
+		// Calculate bonus
+		bonus := spaceCount*spaceSquareBonus + behindCount*spaceBehindPawnBonus
+
+		score += sign * bonus
+	}
+
+	return score
+}
+
+// evaluateTrappedPieces evaluates penalties for trapped pieces.
+func evaluateTrappedPieces(pos *board.Position) (mgPenalty, egPenalty int) {
+	for color := board.White; color <= board.Black; color++ {
+		sign := 1
+		if color == board.Black {
+			sign = -1
+		}
+
+		enemy := color.Other()
+		ownPawns := pos.Pieces[color][board.Pawn]
+		enemyPawns := pos.Pieces[enemy][board.Pawn]
+
+		// --- Bad Bishop Evaluation ---
+		bishops := pos.Pieces[color][board.Bishop]
+		for temp := bishops; temp != 0; {
+			sq := temp.PopLSB()
+
+			// Determine if bishop is on light or dark squares
+			var bishopColorSquares board.Bitboard
+			if lightSquares.IsSet(sq) {
+				bishopColorSquares = lightSquares
+			} else {
+				bishopColorSquares = darkSquares
+			}
+
+			// Count own pawns on same color squares as bishop
+			blockingPawns := (ownPawns & bishopColorSquares).PopCount()
+			if blockingPawns >= 3 {
+				mgPenalty += sign * badBishopPenaltyMg * blockingPawns
+				egPenalty += sign * badBishopPenaltyEg * blockingPawns
+			}
+
+			// --- Trapped Bishop Detection ---
+			// Check for bishop trapped on a6/h6 (for white bishop) or a3/h3 (for black bishop)
+			// by enemy pawns on b7/g7 and b5/g5
+			if color == board.White {
+				// White bishop on a6 trapped by black pawns on b7 and b5
+				if sq == board.A6 {
+					if enemyPawns.IsSet(board.B7) && enemyPawns.IsSet(board.B5) {
+						mgPenalty += sign * trappedBishopPenaltyMg
+						egPenalty += sign * trappedBishopPenaltyEg
+					}
+				}
+				// White bishop on h6 trapped by black pawns on g7 and g5
+				if sq == board.H6 {
+					if enemyPawns.IsSet(board.G7) && enemyPawns.IsSet(board.G5) {
+						mgPenalty += sign * trappedBishopPenaltyMg
+						egPenalty += sign * trappedBishopPenaltyEg
+					}
+				}
+			} else {
+				// Black bishop on a3 trapped by white pawns on b2 and b4
+				if sq == board.A3 {
+					if enemyPawns.IsSet(board.B2) && enemyPawns.IsSet(board.B4) {
+						mgPenalty += sign * trappedBishopPenaltyMg
+						egPenalty += sign * trappedBishopPenaltyEg
+					}
+				}
+				// Black bishop on h3 trapped by white pawns on g2 and g4
+				if sq == board.H3 {
+					if enemyPawns.IsSet(board.G2) && enemyPawns.IsSet(board.G4) {
+						mgPenalty += sign * trappedBishopPenaltyMg
+						egPenalty += sign * trappedBishopPenaltyEg
+					}
+				}
+			}
+		}
+
+		// --- Trapped Rook Detection ---
+		// Rook trapped in corner by own king (before castling)
+		kingSquare := pos.KingSquare[color]
+		rooks := pos.Pieces[color][board.Rook]
+
+		if color == board.White {
+			// King on f1/g1, rook on g1/h1 (kingside)
+			if kingSquare == board.F1 || kingSquare == board.G1 {
+				trappedRookMask := board.SquareBB(board.G1) | board.SquareBB(board.H1)
+				if rooks&trappedRookMask != 0 {
+					// Check if can't castle kingside
+					if pos.CastlingRights&board.WhiteKingSideCastle == 0 {
+						mgPenalty += sign * trappedRookPenaltyMg
+						egPenalty += sign * trappedRookPenaltyEg
+					}
+				}
+			}
+			// King on b1/c1/d1, rook on a1/b1 (queenside)
+			if kingSquare == board.B1 || kingSquare == board.C1 || kingSquare == board.D1 {
+				trappedRookMask := board.SquareBB(board.A1) | board.SquareBB(board.B1)
+				if rooks&trappedRookMask != 0 {
+					if pos.CastlingRights&board.WhiteQueenSideCastle == 0 {
+						mgPenalty += sign * trappedRookPenaltyMg
+						egPenalty += sign * trappedRookPenaltyEg
+					}
+				}
+			}
+		} else {
+			// Black: King on f8/g8, rook on g8/h8 (kingside)
+			if kingSquare == board.F8 || kingSquare == board.G8 {
+				trappedRookMask := board.SquareBB(board.G8) | board.SquareBB(board.H8)
+				if rooks&trappedRookMask != 0 {
+					if pos.CastlingRights&board.BlackKingSideCastle == 0 {
+						mgPenalty += sign * trappedRookPenaltyMg
+						egPenalty += sign * trappedRookPenaltyEg
+					}
+				}
+			}
+			// Black: King on b8/c8/d8, rook on a8/b8 (queenside)
+			if kingSquare == board.B8 || kingSquare == board.C8 || kingSquare == board.D8 {
+				trappedRookMask := board.SquareBB(board.A8) | board.SquareBB(board.B8)
+				if rooks&trappedRookMask != 0 {
+					if pos.CastlingRights&board.BlackQueenSideCastle == 0 {
+						mgPenalty += sign * trappedRookPenaltyMg
+						egPenalty += sign * trappedRookPenaltyEg
+					}
+				}
+			}
+		}
+
+		// --- Knight on Rim Detection ---
+		knights := pos.Pieces[color][board.Knight]
+		rimKnights := knights & rimSquares
+		for temp := rimKnights; temp != 0; {
+			sq := temp.PopLSB()
+
+			// Corner knights are worst
+			if cornerSquares.IsSet(sq) {
+				mgPenalty += sign * knightCornerPenaltyMg
+				egPenalty += sign * knightCornerPenaltyEg
+				continue
+			}
+
+			// Check mobility of rim knight
+			attacks := board.KnightAttacks(sq) &^ pos.Occupied[color]
+			mobility := attacks.PopCount()
+
+			// Penalize if very low mobility (3 or fewer moves)
+			if mobility <= 3 {
+				mgPenalty += sign * knightRimPenaltyMg
+				egPenalty += sign * knightRimPenaltyEg
+			}
+		}
+	}
+
+	return mgPenalty, egPenalty
 }

@@ -2,10 +2,12 @@ package ui
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hailam/chessplay/internal/board"
 	"github.com/hailam/chessplay/internal/engine"
+	"github.com/hailam/chessplay/internal/storage"
 )
 
 // UI Constants
@@ -34,6 +36,14 @@ const (
 	DifficultyHard
 )
 
+// EvalMode represents the evaluation engine mode.
+type EvalMode int
+
+const (
+	EvalClassical EvalMode = iota
+	EvalNNUE
+)
+
 // Game implements ebiten.Game interface.
 type Game struct {
 	// Core game state
@@ -53,12 +63,23 @@ type Game struct {
 	// Game settings
 	mode       GameMode
 	difficulty Difficulty
+	evalMode   EvalMode
+	username   string
+
+	// Storage
+	storage *storage.Storage
+	prefs   *storage.UserPreferences
 
 	// Components
 	renderer *Renderer
 	input    *InputHandler
 	panel    *Panel
 	feedback *FeedbackManager
+
+	// Modals
+	settingsModal *SettingsModal
+	welcomeScreen *WelcomeScreen
+	downloader    *Downloader
 
 	// AI Engine
 	engine     *engine.Engine
@@ -77,23 +98,129 @@ func NewGame() *Game {
 		selectedSquare: board.NoSquare,
 		mode:           ModeHumanVsComputer,
 		difficulty:     DifficultyMedium,
+		evalMode:       EvalClassical,
+		username:       "Player",
 		renderer:       NewRenderer(BoardSize, SquareSize),
 		input:          NewInputHandler(),
 		engine:         engine.NewEngine(64), // 64MB hash table
 		aiMove:         make(chan board.Move, 1),
 	}
 
+	// Initialize storage
+	var err error
+	g.storage, err = storage.NewStorage()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize storage: %v", err)
+	}
+
+	// Load preferences
+	g.loadPreferences()
+
 	// Set initial engine difficulty
 	g.engine.SetDifficulty(engine.Medium)
 
 	g.panel = NewPanel(g)
 	g.feedback = NewFeedbackManager()
+
+	// Initialize modals
+	g.settingsModal = NewSettingsModal()
+	g.welcomeScreen = NewWelcomeScreen()
+	g.downloader = NewDownloader()
+
 	g.position.UpdateCheckers()
 
 	// Initialize position hash history with starting position
 	g.positionHashes = []uint64{g.position.Hash}
 
+	// Check for first launch
+	g.checkFirstLaunch()
+
 	return g
+}
+
+// loadPreferences loads user preferences from storage.
+func (g *Game) loadPreferences() {
+	if g.storage == nil {
+		g.prefs = storage.DefaultPreferences()
+		return
+	}
+
+	var err error
+	g.prefs, err = g.storage.LoadPreferences()
+	if err != nil {
+		log.Printf("Warning: Failed to load preferences: %v", err)
+		g.prefs = storage.DefaultPreferences()
+	}
+
+	// Apply preferences
+	g.username = g.prefs.Username
+	g.difficulty = Difficulty(g.prefs.Difficulty)
+	g.evalMode = EvalMode(g.prefs.EvalMode)
+	g.mode = GameMode(g.prefs.GameMode)
+
+	// Update engine difficulty
+	switch g.difficulty {
+	case DifficultyEasy:
+		g.engine.SetDifficulty(engine.Easy)
+	case DifficultyMedium:
+		g.engine.SetDifficulty(engine.Medium)
+	case DifficultyHard:
+		g.engine.SetDifficulty(engine.Hard)
+	}
+}
+
+// savePreferences saves current preferences to storage.
+func (g *Game) savePreferences() {
+	if g.storage == nil {
+		return
+	}
+
+	g.prefs.Username = g.username
+	g.prefs.Difficulty = storage.Difficulty(g.difficulty)
+	g.prefs.EvalMode = storage.EvalMode(g.evalMode)
+	g.prefs.GameMode = storage.GameMode(g.mode)
+
+	if err := g.storage.SavePreferences(g.prefs); err != nil {
+		log.Printf("Warning: Failed to save preferences: %v", err)
+	}
+}
+
+// checkFirstLaunch shows welcome screen on first launch.
+func (g *Game) checkFirstLaunch() {
+	if g.storage == nil {
+		return
+	}
+
+	isFirst, err := g.storage.IsFirstLaunch()
+	if err != nil {
+		log.Printf("Warning: Failed to check first launch: %v", err)
+		return
+	}
+
+	if isFirst {
+		g.welcomeScreen.Show(func(name string, evalMode storage.EvalMode) {
+			g.username = name
+			g.prefs.Username = name
+			g.prefs.EvalMode = evalMode
+
+			if err := g.storage.MarkFirstLaunchComplete(); err != nil {
+				log.Printf("Warning: Failed to mark first launch complete: %v", err)
+			}
+
+			// If NNUE selected, check if we need to download
+			if evalMode == storage.EvalNNUE {
+				smallExists, bigExists, err := CheckNNUENetworks()
+				if err != nil || !smallExists || !bigExists {
+					g.savePreferences()
+					g.showNNUEDownload()
+					return
+				}
+			}
+
+			g.evalMode = EvalMode(evalMode)
+			g.savePreferences()
+		})
+	}
 }
 
 // Update handles game logic updates.
@@ -103,6 +230,24 @@ func (g *Game) Update() error {
 
 	// Update feedback animations
 	g.feedback.Update()
+
+	// Handle welcome screen first (blocks other input)
+	if g.welcomeScreen.IsVisible() {
+		g.welcomeScreen.Update(g.input)
+		return nil
+	}
+
+	// Handle downloader (blocks other input)
+	if g.downloader.IsVisible() {
+		g.downloader.Update(g.input)
+		return nil
+	}
+
+	// Handle settings modal (blocks other input)
+	if g.settingsModal.IsVisible() {
+		g.settingsModal.Update(g.input)
+		return nil
+	}
 
 	// Handle panel interactions
 	if g.panel.HandleInput(g.input) {
@@ -148,6 +293,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	// Draw panel
 	g.panel.Draw(screen, g.renderer)
+
+	// Draw modals on top
+	g.settingsModal.Draw(screen)
+	g.downloader.Draw(screen)
+	g.welcomeScreen.Draw(screen)
 }
 
 // Layout returns the game's screen dimensions.
@@ -548,4 +698,63 @@ func (g *Game) GameResult() string {
 // IsAIThinking returns true if the AI is currently thinking.
 func (g *Game) IsAIThinking() bool {
 	return g.aiThinking
+}
+
+// Username returns the current username.
+func (g *Game) Username() string {
+	return g.username
+}
+
+// EvalMode returns the current evaluation mode.
+func (g *Game) EvalMode() EvalMode {
+	return g.evalMode
+}
+
+// ShowSettings opens the settings modal.
+func (g *Game) ShowSettings() {
+	g.settingsModal.Show(g.prefs, func(prefs *storage.UserPreferences) {
+		// Apply all preferences immediately
+		g.username = prefs.Username
+		g.SetDifficulty(Difficulty(prefs.Difficulty))
+		g.prefs.SoundEnabled = prefs.SoundEnabled
+		g.prefs.Username = prefs.Username
+		g.prefs.Difficulty = prefs.Difficulty
+		g.prefs.EvalMode = prefs.EvalMode
+
+		// Handle NNUE mode - check if networks need downloading
+		if prefs.EvalMode == storage.EvalNNUE {
+			smallExists, bigExists, _ := CheckNNUENetworks()
+			if !smallExists || !bigExists {
+				// Networks missing - start download, evalMode will be set on completion
+				g.savePreferences()
+				g.showNNUEDownload()
+				return
+			}
+		}
+
+		// Update eval mode (either Classical, or NNUE with files ready)
+		g.evalMode = EvalMode(prefs.EvalMode)
+		g.savePreferences()
+	}, nil)
+}
+
+// showNNUEDownload shows the NNUE download dialog.
+func (g *Game) showNNUEDownload() {
+	g.downloader.Show(func() {
+		// Download complete
+		g.evalMode = EvalNNUE
+		log.Printf("NNUE networks downloaded successfully")
+	}, func() {
+		// Download cancelled - revert to classical
+		g.evalMode = EvalClassical
+		g.prefs.EvalMode = storage.EvalClassical
+		g.savePreferences()
+	})
+}
+
+// Close cleans up game resources.
+func (g *Game) Close() {
+	if g.storage != nil {
+		g.storage.Close()
+	}
 }
