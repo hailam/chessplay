@@ -234,23 +234,27 @@ func (g *Game) Update() error {
 	// Handle welcome screen first (blocks other input)
 	if g.welcomeScreen.IsVisible() {
 		g.welcomeScreen.Update(g.input)
+		g.updateCursor()
 		return nil
 	}
 
 	// Handle downloader (blocks other input)
 	if g.downloader.IsVisible() {
 		g.downloader.Update(g.input)
+		g.updateCursor()
 		return nil
 	}
 
 	// Handle settings modal (blocks other input)
 	if g.settingsModal.IsVisible() {
 		g.settingsModal.Update(g.input)
+		g.updateCursor()
 		return nil
 	}
 
 	// Handle panel interactions
 	if g.panel.HandleInput(g.input) {
+		g.updateCursor()
 		return nil // Panel handled the input
 	}
 
@@ -260,7 +264,30 @@ func (g *Game) Update() error {
 	// Check for AI move
 	g.checkAIMove()
 
+	// Update cursor based on hover state
+	g.updateCursor()
+
 	return nil
+}
+
+// updateCursor sets the cursor shape based on what's being hovered.
+func (g *Game) updateCursor() {
+	anyHovered := false
+
+	// Check all interactive elements
+	if g.welcomeScreen.IsVisible() {
+		anyHovered = g.welcomeScreen.AnyButtonHovered()
+	} else if g.settingsModal.IsVisible() {
+		anyHovered = g.settingsModal.AnyButtonHovered()
+	} else {
+		anyHovered = g.panel.AnyButtonHovered()
+	}
+
+	if anyHovered {
+		ebiten.SetCursorShape(ebiten.CursorShapePointer)
+	} else {
+		ebiten.SetCursorShape(ebiten.CursorShapeDefault)
+	}
 }
 
 // Draw renders the game.
@@ -725,8 +752,11 @@ func (g *Game) ShowSettings() {
 		if prefs.EvalMode == storage.EvalNNUE {
 			smallExists, bigExists, _ := CheckNNUENetworks()
 			if !smallExists || !bigExists {
-				// Networks missing - start download, evalMode will be set on completion
-				g.savePreferences()
+				// Networks missing - save prefs directly (don't use savePreferences which
+				// overwrites EvalMode with g.evalMode), then start download
+				if g.storage != nil {
+					g.storage.SavePreferences(g.prefs)
+				}
 				g.showNNUEDownload()
 				return
 			}
@@ -741,8 +771,9 @@ func (g *Game) ShowSettings() {
 // showNNUEDownload shows the NNUE download dialog.
 func (g *Game) showNNUEDownload() {
 	g.downloader.Show(func() {
-		// Download complete
+		// Download complete - update eval mode and save
 		g.evalMode = EvalNNUE
+		g.savePreferences()
 		log.Printf("NNUE networks downloaded successfully")
 	}, func() {
 		// Download cancelled - revert to classical

@@ -126,6 +126,14 @@ func (ws *WelcomeScreen) Update(input *InputHandler) bool {
 	return true
 }
 
+// AnyButtonHovered returns true if any button in the screen is hovered.
+func (ws *WelcomeScreen) AnyButtonHovered() bool {
+	if !ws.visible {
+		return false
+	}
+	return ws.startBtn.IsHovered() || ws.evalModeRadio.hovered >= 0
+}
+
 // Draw renders the welcome screen.
 func (ws *WelcomeScreen) Draw(screen *ebiten.Image) {
 	if !ws.visible {

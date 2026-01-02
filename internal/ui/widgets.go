@@ -10,17 +10,17 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
-// Widget colors (consistent with panel.go)
+// Widget colors (uses colors from panel.go: buttonBg, buttonHoverBg, accentColor, textPrimary, textSecondary)
 var (
-	widgetBg         = color.RGBA{48, 52, 58, 255}
-	widgetBorder     = color.RGBA{68, 72, 78, 255}
+	widgetBg          = color.RGBA{48, 52, 58, 255}
+	widgetBorder      = color.RGBA{68, 72, 78, 255}
 	widgetFocusBorder = color.RGBA{76, 175, 120, 255}
-	widgetHoverBg    = color.RGBA{58, 62, 68, 255}
-	radioActive      = color.RGBA{76, 175, 120, 255}
-	radioInactive    = color.RGBA{88, 92, 98, 255}
-	checkboxCheck    = color.RGBA{76, 175, 120, 255}
-	inputTextColor   = color.RGBA{240, 240, 245, 255}
-	inputPlaceholder = color.RGBA{120, 125, 135, 255}
+	widgetHoverBg     = color.RGBA{65, 70, 78, 255}   // Brighter hover
+	radioActive       = color.RGBA{76, 175, 120, 255}
+	radioInactive     = color.RGBA{70, 75, 82, 255}   // Softer inactive
+	checkboxCheck     = color.RGBA{76, 175, 120, 255}
+	inputTextColor    = color.RGBA{240, 240, 245, 255}
+	inputPlaceholder  = color.RGBA{120, 125, 135, 255}
 )
 
 // TextInput is an editable text field widget.
@@ -30,6 +30,7 @@ type TextInput struct {
 	Placeholder  string
 	MaxLength    int
 	focused      bool
+	hovered      bool
 	cursorBlink  int
 }
 
@@ -45,11 +46,11 @@ func NewTextInput(x, y, w, h int, placeholder string, maxLen int) *TextInput {
 // Update handles text input updates.
 func (ti *TextInput) Update(input *InputHandler) bool {
 	mx, my := input.MousePosition()
-	hovered := mx >= ti.X && mx < ti.X+ti.W && my >= ti.Y && my < ti.Y+ti.H
+	ti.hovered = mx >= ti.X && mx < ti.X+ti.W && my >= ti.Y && my < ti.Y+ti.H
 
 	// Handle click to focus
 	if input.IsLeftJustPressed() {
-		ti.focused = hovered
+		ti.focused = ti.hovered
 	}
 
 	if !ti.focused {
@@ -87,13 +88,19 @@ func (ti *TextInput) Update(input *InputHandler) bool {
 
 // Draw renders the text input.
 func (ti *TextInput) Draw(screen *ebiten.Image) {
-	// Background
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), float32(ti.W), float32(ti.H), widgetBg, false)
+	// Background - slightly lighter on hover
+	bgColor := widgetBg
+	if ti.hovered && !ti.focused {
+		bgColor = color.RGBA{52, 56, 62, 255}
+	}
+	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), float32(ti.W), float32(ti.H), bgColor, false)
 
-	// Border
+	// Border - accent on hover/focus
 	borderColor := widgetBorder
 	if ti.focused {
 		borderColor = widgetFocusBorder
+	} else if ti.hovered {
+		borderColor = accentColor
 	}
 	vector.StrokeRect(screen, float32(ti.X), float32(ti.Y), float32(ti.W), float32(ti.H), 2, borderColor, false)
 
@@ -200,6 +207,12 @@ func (rg *RadioGroup) Draw(screen *ebiten.Image) {
 		isSelected := i == rg.Selected
 		isHovered := i == rg.hovered
 
+		// Draw hover background
+		if isHovered && !isSelected {
+			hoverBg := color.RGBA{55, 60, 68, 255}
+			vector.DrawFilledRect(screen, float32(rg.X-4), float32(itemY), 200, float32(rg.ItemH), hoverBg, false)
+		}
+
 		// Radio circle
 		cx := float32(rg.X + 10)
 		cy := float32(itemY + rg.ItemH/2)
@@ -210,7 +223,7 @@ func (rg *RadioGroup) Draw(screen *ebiten.Image) {
 		if isSelected {
 			circleColor = radioActive
 		} else if isHovered {
-			circleColor = widgetHoverBg
+			circleColor = accentColor
 		}
 		vector.DrawFilledCircle(screen, cx, cy, radius, circleColor, false)
 
@@ -227,6 +240,8 @@ func (rg *RadioGroup) Draw(screen *ebiten.Image) {
 		textColor := textSecondary
 		if isSelected {
 			textColor = textPrimary
+		} else if isHovered {
+			textColor = inputTextColor
 		}
 		op.ColorScale.ScaleWithColor(textColor)
 		text.Draw(screen, opt.Label, face, op)
@@ -280,7 +295,15 @@ func (cb *Checkbox) Draw(screen *ebiten.Image) {
 		bgColor = widgetHoverBg
 	}
 	vector.DrawFilledRect(screen, boxX, boxY, boxSize, boxSize, bgColor, false)
-	vector.StrokeRect(screen, boxX, boxY, boxSize, boxSize, 2, widgetBorder, false)
+
+	// Border - accent on hover
+	borderC := widgetBorder
+	if cb.hovered {
+		borderC = accentColor
+	} else if cb.Checked {
+		borderC = checkboxCheck
+	}
+	vector.StrokeRect(screen, boxX, boxY, boxSize, boxSize, 2, borderC, false)
 
 	// Checkmark
 	if cb.Checked {
@@ -297,6 +320,8 @@ func (cb *Checkbox) Draw(screen *ebiten.Image) {
 	textColor := textSecondary
 	if cb.Checked {
 		textColor = textPrimary
+	} else if cb.hovered {
+		textColor = inputTextColor
 	}
 	op.ColorScale.ScaleWithColor(textColor)
 	text.Draw(screen, cb.Label, face, op)
@@ -310,6 +335,7 @@ type ButtonGroup struct {
 	ButtonW  int
 	ButtonH  int
 	hovered  int
+	pressed  int
 }
 
 // NewButtonGroup creates a new button group.
@@ -322,6 +348,7 @@ func NewButtonGroup(x, y int, options []string, selected int, buttonW, buttonH i
 		ButtonW:  buttonW,
 		ButtonH:  buttonH,
 		hovered:  -1,
+		pressed:  -1,
 	}
 }
 
@@ -329,11 +356,15 @@ func NewButtonGroup(x, y int, options []string, selected int, buttonW, buttonH i
 func (bg *ButtonGroup) Update(input *InputHandler) bool {
 	mx, my := input.MousePosition()
 	bg.hovered = -1
+	bg.pressed = -1
 
 	for i := range bg.Options {
 		btnX := bg.X + i*bg.ButtonW
 		if mx >= btnX && mx < btnX+bg.ButtonW && my >= bg.Y && my < bg.Y+bg.ButtonH {
 			bg.hovered = i
+			if input.IsLeftPressed() {
+				bg.pressed = i
+			}
 			if input.IsLeftJustPressed() {
 				bg.Selected = i
 				return true
@@ -350,19 +381,38 @@ func (bg *ButtonGroup) Draw(screen *ebiten.Image) {
 		return
 	}
 
+	// Tab colors - keep in sync with panel.go
+	tabActive := color.RGBA{76, 132, 96, 255}
+	tabInactive := color.RGBA{50, 54, 60, 255}
+	tabHover := color.RGBA{65, 70, 78, 255}
+	tabPressed := color.RGBA{40, 44, 50, 255}
+	borderColor := color.RGBA{70, 75, 82, 255}
+
 	for i, label := range bg.Options {
 		btnX := bg.X + i*bg.ButtonW
 		isSelected := i == bg.Selected
 		isHovered := i == bg.hovered
+		isPressed := i == bg.pressed
 
 		// Button background
-		bgColor := tabInactiveBg
+		bgColor := tabInactive
 		if isSelected {
-			bgColor = tabActiveBg
+			bgColor = tabActive
+		} else if isPressed {
+			bgColor = tabPressed
 		} else if isHovered {
-			bgColor = tabHoverBg
+			bgColor = tabHover
 		}
 		vector.DrawFilledRect(screen, float32(btnX), float32(bg.Y), float32(bg.ButtonW), float32(bg.ButtonH), bgColor, false)
+
+		// Border - accent on hover, match bg on selected
+		bordC := borderColor
+		if isSelected {
+			bordC = tabActive
+		} else if isHovered {
+			bordC = accentColor
+		}
+		vector.StrokeRect(screen, float32(btnX), float32(bg.Y), float32(bg.ButtonW), float32(bg.ButtonH), 1, bordC, false)
 
 		// Label
 		w, h := MeasureText(label, face)
@@ -386,6 +436,12 @@ type ModalButton struct {
 	Primary    bool
 	OnClick    func()
 	hovered    bool
+	pressed    bool
+}
+
+// IsHovered returns true if the button is hovered.
+func (mb *ModalButton) IsHovered() bool {
+	return mb.hovered
 }
 
 // NewModalButton creates a new modal button.
@@ -402,6 +458,7 @@ func NewModalButton(x, y, w, h int, label string, primary bool, onClick func()) 
 func (mb *ModalButton) Update(input *InputHandler) bool {
 	mx, my := input.MousePosition()
 	mb.hovered = mx >= mb.X && mx < mb.X+mb.W && my >= mb.Y && my < mb.Y+mb.H
+	mb.pressed = input.IsLeftPressed() && mb.hovered
 
 	if input.IsLeftJustPressed() && mb.hovered && mb.OnClick != nil {
 		mb.OnClick()
@@ -417,17 +474,35 @@ func (mb *ModalButton) Draw(screen *ebiten.Image) {
 		return
 	}
 
-	// Background
-	bgColor := buttonBg
+	// Button colors
+	var bgColor color.RGBA
+	var borderC color.RGBA
+
 	if mb.Primary {
 		bgColor = accentColor
-		if mb.hovered {
+		borderC = color.RGBA{56, 155, 100, 255}
+		if mb.pressed {
+			bgColor = color.RGBA{56, 155, 100, 255}
+		} else if mb.hovered {
 			bgColor = color.RGBA{96, 195, 140, 255}
+			borderC = color.RGBA{116, 215, 160, 255}
 		}
-	} else if mb.hovered {
-		bgColor = buttonHoverBg
+	} else {
+		bgColor = buttonBg
+		borderC = widgetBorder
+		if mb.pressed {
+			bgColor = color.RGBA{40, 44, 50, 255}
+		} else if mb.hovered {
+			bgColor = buttonHoverBg
+			borderC = accentColor
+		}
 	}
+
+	// Draw background
 	vector.DrawFilledRect(screen, float32(mb.X), float32(mb.Y), float32(mb.W), float32(mb.H), bgColor, false)
+
+	// Draw border
+	vector.StrokeRect(screen, float32(mb.X), float32(mb.Y), float32(mb.W), float32(mb.H), 1, borderC, false)
 
 	// Label
 	w, h := MeasureText(mb.Label, face)

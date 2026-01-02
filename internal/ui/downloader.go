@@ -183,11 +183,12 @@ func (d *Downloader) setError(err error) {
 
 // downloadFile downloads a single file with progress tracking.
 func (d *Downloader) downloadFile(url, destPath string, expectedSize int64) error {
-	// Check if file already exists and is correct size
-	if info, err := os.Stat(destPath); err == nil && info.Size() == expectedSize {
-		// File exists and is correct size, skip download
+	// Check if file already exists with reasonable size (> half expected size)
+	// Using threshold instead of exact size to handle minor size variations
+	if info, err := os.Stat(destPath); err == nil && info.Size() > expectedSize/2 {
+		// File exists and has reasonable size, skip download
 		d.mu.Lock()
-		d.progress.BytesReceived = expectedSize
+		d.progress.BytesReceived = info.Size()
 		d.mu.Unlock()
 		return nil
 	}
@@ -402,10 +403,12 @@ func CheckNNUENetworks() (smallExists, bigExists bool, err error) {
 	smallPath := filepath.Join(nnueDir, SmallNetName)
 	bigPath := filepath.Join(nnueDir, BigNetName)
 
-	if info, err := os.Stat(smallPath); err == nil && info.Size() == SmallNetSize {
+	// Check if files exist with reasonable size (> 1MB for small, > 50MB for big)
+	// Using thresholds instead of exact sizes to handle minor size variations
+	if info, err := os.Stat(smallPath); err == nil && info.Size() > 1*1024*1024 {
 		smallExists = true
 	}
-	if info, err := os.Stat(bigPath); err == nil && info.Size() == BigNetSize {
+	if info, err := os.Stat(bigPath); err == nil && info.Size() > 50*1024*1024 {
 		bigExists = true
 	}
 

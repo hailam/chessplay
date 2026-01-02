@@ -29,7 +29,7 @@ func DefaultTheme() *Theme {
 		DarkSquare:     color.RGBA{181, 136, 99, 255},  // Brown
 		SelectedSquare: color.RGBA{247, 247, 105, 180}, // Yellow highlight
 		LegalMoveColor: color.RGBA{130, 151, 105, 200}, // Green dots
-		LastMoveColor:  color.RGBA{205, 210, 106, 150}, // Yellow-green
+		LastMoveColor:  color.RGBA{180, 190, 100, 90},  // Softer yellow-green (reduced alpha)
 		CheckColor:     color.RGBA{255, 100, 100, 180}, // Red
 		Background:     color.RGBA{40, 44, 52, 255},    // Dark gray
 		TextColor:      color.RGBA{220, 220, 220, 255}, // Light gray

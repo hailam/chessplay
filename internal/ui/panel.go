@@ -15,9 +15,9 @@ const (
 	SectionSpacing  = 28
 	ButtonHeight    = 40
 	TabHeight       = 34
-	CollapsedWidth  = 24
-	CollapseButtonW = 20
-	CollapseButtonH = 32
+	CollapsedWidth  = 20
+	CollapseButtonW = 16
+	CollapseButtonH = 48
 	SectionLabelH   = 20
 )
 
@@ -26,12 +26,16 @@ var (
 	panelBg         = color.RGBA{38, 40, 45, 255}    // Dark background
 	sectionBg       = color.RGBA{48, 52, 58, 255}    // Slightly lighter section
 	tabActiveBg     = color.RGBA{76, 132, 96, 255}   // Green for active tab
-	tabInactiveBg   = color.RGBA{58, 62, 68, 255}    // Gray for inactive
-	tabHoverBg      = color.RGBA{68, 72, 78, 255}    // Hover state
-	buttonBg        = color.RGBA{58, 62, 68, 255}    // Button background
-	buttonHoverBg   = color.RGBA{78, 82, 88, 255}    // Button hover
+	tabInactiveBg   = color.RGBA{50, 54, 60, 255}    // Darker gray for inactive
+	tabHoverBg      = color.RGBA{65, 70, 78, 255}    // Visible hover state
+	buttonBg        = color.RGBA{50, 54, 60, 255}    // Button background (darker)
+	buttonHoverBg   = color.RGBA{65, 70, 78, 255}    // Button hover (brighter)
+	buttonPressedBg = color.RGBA{40, 44, 50, 255}    // Button pressed (darker)
+	buttonBorder    = color.RGBA{70, 75, 82, 255}    // Subtle button border
 	buttonActiveBg  = color.RGBA{76, 132, 96, 255}   // Active button (green)
 	accentColor     = color.RGBA{76, 175, 120, 255}  // Green accent
+	accentHover     = color.RGBA{96, 195, 140, 255}  // Lighter green on hover
+	accentPressed   = color.RGBA{56, 155, 100, 255}  // Darker green on press
 	textPrimary     = color.RGBA{240, 240, 245, 255} // Primary text
 	textSecondary   = color.RGBA{160, 165, 175, 255} // Secondary text
 	textMuted       = color.RGBA{120, 125, 135, 255} // Muted text
@@ -39,7 +43,7 @@ var (
 	moveRowAlt      = color.RGBA{44, 48, 54, 255}    // Alternating row
 	statusThinking  = color.RGBA{100, 180, 255, 255} // Blue for thinking
 	statusGameOver  = color.RGBA{255, 200, 80, 255}  // Yellow for game over
-	collapseButtonC = color.RGBA{58, 62, 68, 255}    // Collapse button
+	collapseButtonC = color.RGBA{60, 65, 72, 255}    // Collapse button (lighter for visibility)
 )
 
 // Button represents a clickable UI element.
@@ -48,6 +52,7 @@ type Button struct {
 	Label      string
 	OnClick    func()
 	hovered    bool
+	pressed    bool
 	active     bool
 }
 
@@ -81,18 +86,19 @@ func NewPanel(g *Game) *Panel {
 
 // createButtons initializes all panel buttons.
 func (p *Panel) createButtons() {
-	// Collapse/expand button (top-right corner, small)
+	// Collapse/expand button - integrated tab at panel edge
+	tabY := (ScreenHeight - CollapseButtonH) / 2 // Vertically centered
 	if p.collapsed {
 		p.collapseBtn = &Button{
 			X: BoardSize + 2,
-			Y: 4,
+			Y: tabY,
 			W: CollapseButtonW, H: CollapseButtonH,
 			OnClick: func() { p.toggleCollapse() },
 		}
 	} else {
 		p.collapseBtn = &Button{
-			X: BoardSize + PanelWidth - CollapseButtonW - 4,
-			Y: 4,
+			X: BoardSize, // Flush with panel left edge
+			Y: tabY,
 			W: CollapseButtonW, H: CollapseButtonH,
 			OnClick: func() { p.toggleCollapse() },
 		}
@@ -159,6 +165,8 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 
 	// Always check collapse button
 	p.collapseBtn.hovered = p.isInside(mx, my, p.collapseBtn)
+	p.collapseBtn.pressed = input.IsLeftPressed() && p.collapseBtn.hovered
+
 	if input.IsLeftJustPressed() && p.collapseBtn.hovered {
 		p.collapseBtn.OnClick() // toggleCollapse handles button recreation and window resize
 		return true
@@ -184,7 +192,7 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 		}
 	}
 
-	// Check other buttons
+	// Check other buttons for hover
 	p.newGameBtn.hovered = p.isInside(mx, my, p.newGameBtn)
 	p.settingsBtn.hovered = p.isInside(mx, my, p.settingsBtn)
 	for _, btn := range p.modeTabs {
@@ -192,6 +200,28 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 	}
 	for _, btn := range p.diffTabs {
 		btn.hovered = p.isInside(mx, my, btn)
+	}
+
+	// Track pressed state (mouse down on button)
+	if input.IsLeftPressed() {
+		p.newGameBtn.pressed = p.newGameBtn.hovered
+		p.settingsBtn.pressed = p.settingsBtn.hovered
+		for _, btn := range p.modeTabs {
+			btn.pressed = btn.hovered
+		}
+		for _, btn := range p.diffTabs {
+			btn.pressed = btn.hovered
+		}
+	} else {
+		// Clear pressed state when mouse released
+		p.newGameBtn.pressed = false
+		p.settingsBtn.pressed = false
+		for _, btn := range p.modeTabs {
+			btn.pressed = false
+		}
+		for _, btn := range p.diffTabs {
+			btn.pressed = false
+		}
 	}
 
 	// Handle clicks
@@ -220,6 +250,30 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 		}
 	}
 
+	return false
+}
+
+// AnyButtonHovered returns true if any button in the panel is hovered.
+func (p *Panel) AnyButtonHovered() bool {
+	if p.collapseBtn.hovered {
+		return true
+	}
+	if p.collapsed {
+		return false
+	}
+	if p.newGameBtn.hovered || p.settingsBtn.hovered {
+		return true
+	}
+	for _, btn := range p.modeTabs {
+		if btn.hovered {
+			return true
+		}
+	}
+	for _, btn := range p.diffTabs {
+		if btn.hovered {
+			return true
+		}
+	}
 	return false
 }
 
@@ -280,30 +334,45 @@ func (p *Panel) getHistoryStartY() int {
 
 func (p *Panel) drawCollapseButton(screen *ebiten.Image, expand bool) {
 	btn := p.collapseBtn
-	bgColor := collapseButtonC
+
+	// Use panel background color to blend in as integrated tab
+	bgColor := panelBg
 	if btn.hovered {
-		bgColor = buttonHoverBg
+		bgColor = sectionBg // Subtle highlight on hover
 	}
 
-	// Draw rounded rect
+	// Draw as integrated tab (no border, blends with panel)
 	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
 
-	// Draw arrow icon
+	// Draw arrow - muted by default, bright on hover
 	arrow := "‹"
 	if expand {
 		arrow = "›"
 	}
-	p.drawTextCentered(screen, arrow, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
+	textC := textMuted
+	if btn.hovered {
+		textC = textPrimary
+	}
+	p.drawTextCentered(screen, arrow, btn.X+btn.W/2, btn.Y+btn.H/2, textC)
 }
 
 func (p *Panel) drawPrimaryButton(screen *ebiten.Image, btn *Button) {
 	bgColor := accentColor
-	if btn.hovered {
-		bgColor = color.RGBA{96, 195, 140, 255} // Lighter green on hover
+	if btn.pressed {
+		bgColor = accentPressed
+	} else if btn.hovered {
+		bgColor = accentHover
 	}
 
-	// Draw button with rounded corners (approximated with filled rect)
+	// Draw button background
 	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+	// Draw border for depth
+	borderC := color.RGBA{56, 155, 100, 255}
+	if btn.hovered {
+		borderC = color.RGBA{116, 215, 160, 255} // Lighter border on hover
+	}
+	vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
 
 	// Draw label
 	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
@@ -311,11 +380,22 @@ func (p *Panel) drawPrimaryButton(screen *ebiten.Image, btn *Button) {
 
 func (p *Panel) drawSecondaryButton(screen *ebiten.Image, btn *Button) {
 	bgColor := buttonBg
-	if btn.hovered {
+	if btn.pressed {
+		bgColor = buttonPressedBg
+	} else if btn.hovered {
 		bgColor = buttonHoverBg
 	}
 
+	// Draw button background
 	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+	// Draw border
+	borderC := buttonBorder
+	if btn.hovered {
+		borderC = accentColor // Green border on hover
+	}
+	vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
+
 	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textSecondary)
 }
 
@@ -327,11 +407,23 @@ func (p *Panel) drawModeTabs(screen *ebiten.Image) {
 		bgColor := tabInactiveBg
 		if isActive {
 			bgColor = tabActiveBg
+		} else if btn.pressed {
+			bgColor = buttonPressedBg
 		} else if btn.hovered {
 			bgColor = tabHoverBg
 		}
 
+		// Draw background
 		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+		// Draw border - highlight on hover, green on active
+		borderC := buttonBorder
+		if isActive {
+			borderC = tabActiveBg
+		} else if btn.hovered {
+			borderC = accentColor
+		}
+		vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
 
 		textColor := textSecondary
 		if isActive {
@@ -348,11 +440,23 @@ func (p *Panel) drawDifficultyTabs(screen *ebiten.Image) {
 		bgColor := tabInactiveBg
 		if isActive {
 			bgColor = tabActiveBg
+		} else if btn.pressed {
+			bgColor = buttonPressedBg
 		} else if btn.hovered {
 			bgColor = tabHoverBg
 		}
 
+		// Draw background
 		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+
+		// Draw border - highlight on hover, green on active
+		borderC := buttonBorder
+		if isActive {
+			borderC = tabActiveBg
+		} else if btn.hovered {
+			borderC = accentColor
+		}
+		vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
 
 		textColor := textSecondary
 		if isActive {

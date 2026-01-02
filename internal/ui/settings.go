@@ -197,6 +197,16 @@ func (sm *SettingsModal) Update(input *InputHandler) bool {
 	return true
 }
 
+// AnyButtonHovered returns true if any button in the modal is hovered.
+func (sm *SettingsModal) AnyButtonHovered() bool {
+	if !sm.visible {
+		return false
+	}
+	return sm.saveBtn.IsHovered() || sm.cancelBtn.IsHovered() ||
+		sm.evalModeRadio.hovered >= 0 || sm.difficultyBtns.hovered >= 0 ||
+		sm.soundCheckbox.hovered
+}
+
 // Draw renders the settings modal.
 func (sm *SettingsModal) Draw(screen *ebiten.Image) {
 	if !sm.visible {
