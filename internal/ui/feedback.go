@@ -82,13 +82,13 @@ func (tm *ToastManager) Update() {
 }
 
 // Draw renders all active toasts.
-func (tm *ToastManager) Draw(screen *ebiten.Image) {
+func (tm *ToastManager) Draw(screen *ebiten.Image, glass *GlassEffect) {
 	face := GetRegularFace()
 	if face == nil {
 		return
 	}
 
-	y := 50.0
+	y := 50.0 * UIScale
 	for _, t := range tm.toasts {
 		elapsed := time.Since(t.StartTime).Seconds()
 		duration := t.Duration.Seconds()
@@ -103,33 +103,47 @@ func (tm *ToastManager) Draw(screen *ebiten.Image) {
 		}
 
 		// Get colors based on type
-		var bgColor, textColor color.RGBA
+		var tintColor, textColor, borderColor color.RGBA
 		switch t.Type {
 		case ToastWarning:
-			bgColor = color.RGBA{180, 140, 20, uint8(220 * alpha)}
-			textColor = color.RGBA{40, 30, 0, uint8(255 * alpha)}
+			tintColor = color.RGBA{60, 50, 20, uint8(60 * alpha)}
+			borderColor = color.RGBA{180, 140, 20, uint8(180 * alpha)}
+			textColor = color.RGBA{255, 220, 100, uint8(255 * alpha)}
 		case ToastError:
-			bgColor = color.RGBA{180, 50, 50, uint8(220 * alpha)}
-			textColor = color.RGBA{255, 255, 255, uint8(255 * alpha)}
+			tintColor = color.RGBA{60, 30, 30, uint8(60 * alpha)}
+			borderColor = color.RGBA{180, 50, 50, uint8(180 * alpha)}
+			textColor = color.RGBA{255, 200, 200, uint8(255 * alpha)}
 		case ToastSuccess:
-			bgColor = color.RGBA{50, 150, 50, uint8(220 * alpha)}
-			textColor = color.RGBA{255, 255, 255, uint8(255 * alpha)}
+			tintColor = color.RGBA{30, 50, 30, uint8(60 * alpha)}
+			borderColor = color.RGBA{50, 150, 50, uint8(180 * alpha)}
+			textColor = color.RGBA{200, 255, 200, uint8(255 * alpha)}
 		default: // ToastInfo
-			bgColor = color.RGBA{50, 100, 150, uint8(220 * alpha)}
-			textColor = color.RGBA{255, 255, 255, uint8(255 * alpha)}
+			tintColor = color.RGBA{30, 40, 55, uint8(60 * alpha)}
+			borderColor = color.RGBA{50, 100, 150, uint8(180 * alpha)}
+			textColor = color.RGBA{200, 220, 255, uint8(255 * alpha)}
 		}
 
 		// Measure text
 		w, h := MeasureText(t.Message, face)
-		padding := 12.0
+		padding := 14.0 * UIScale
 		boxW := w + padding*2
 		boxH := h + padding*2
 
 		// Center horizontally on the board
-		x := float64(BoardSize)/2 - boxW/2
+		x := float64(BoardSize)*UIScale/2 - boxW/2
 
-		// Draw background
-		vector.DrawFilledRect(screen, float32(x), float32(y), float32(boxW), float32(boxH), bgColor, false)
+		// Draw liquid glass background
+		if glass != nil && glass.IsEnabled() {
+			glass.DrawGlass(screen, int(x), int(y), int(boxW), int(boxH),
+				tintColor, 2.0, 2.0) // sigma=2.0, refraction=2.0 (subtle)
+		} else {
+			// Fallback: semi-transparent background
+			bgColor := color.RGBA{tintColor.R, tintColor.G, tintColor.B, uint8(230 * alpha)}
+			vector.DrawFilledRect(screen, float32(x), float32(y), float32(boxW), float32(boxH), bgColor, false)
+		}
+
+		// Draw border for glass effect
+		vector.StrokeRect(screen, float32(x), float32(y), float32(boxW), float32(boxH), float32(UIScale), borderColor, false)
 
 		// Draw text
 		op := &text.DrawOptions{}
@@ -137,7 +151,7 @@ func (tm *ToastManager) Draw(screen *ebiten.Image) {
 		op.ColorScale.ScaleWithColor(textColor)
 		text.Draw(screen, t.Message, face, op)
 
-		y += boxH + 8
+		y += boxH + 8*UIScale
 	}
 }
 
@@ -256,8 +270,11 @@ func (am *AnimationManager) DrawFlashes(screen *ebiten.Image, renderer *Renderer
 		c := color.RGBA{f.Color.R, f.Color.G, f.Color.B, uint8(float64(f.Color.A) * alpha)}
 
 		x, y := renderer.SquareToScreen(f.Square)
-		size := float32(renderer.SquareSize())
-		vector.DrawFilledRect(screen, float32(x), float32(y), size, size, c, false)
+		// Scale coordinates and size for HiDPI
+		scaledX := float32(float64(x) * UIScale)
+		scaledY := float32(float64(y) * UIScale)
+		size := float32(float64(renderer.SquareSize()) * UIScale)
+		vector.DrawFilledRect(screen, scaledX, scaledY, size, size, c, false)
 	}
 }
 
@@ -284,9 +301,9 @@ func (fm *FeedbackManager) Update() {
 }
 
 // Draw renders all feedback overlays.
-func (fm *FeedbackManager) Draw(screen *ebiten.Image, renderer *Renderer) {
+func (fm *FeedbackManager) Draw(screen *ebiten.Image, renderer *Renderer, glass *GlassEffect) {
 	fm.animations.DrawFlashes(screen, renderer)
-	fm.toasts.Draw(screen)
+	fm.toasts.Draw(screen, glass)
 }
 
 // Animations returns the animation manager for renderer integration.

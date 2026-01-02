@@ -19,6 +19,10 @@ const (
 	PanelWidth   = ScreenWidth - BoardSize
 )
 
+// UIScale is the global HiDPI scale factor for all UI drawing.
+// Set by Game.Layout() and used by widgets and modals.
+var UIScale float64 = 1.0
+
 // GameMode represents the current game mode.
 type GameMode int
 
@@ -81,6 +85,9 @@ type Game struct {
 	welcomeScreen *WelcomeScreen
 	downloader    *Downloader
 
+	// Visual effects
+	glass *GlassEffect
+
 	// AI Engine
 	engine     *engine.Engine
 	aiThinking bool
@@ -89,6 +96,9 @@ type Game struct {
 	// Game state
 	gameOver   bool
 	gameResult string
+
+	// HiDPI scaling
+	scale float64
 }
 
 // NewGame creates a new chess game.
@@ -121,6 +131,7 @@ func NewGame() *Game {
 
 	g.panel = NewPanel(g)
 	g.feedback = NewFeedbackManager()
+	g.glass = NewGlassEffect()
 
 	// Initialize modals
 	g.settingsModal = NewSettingsModal()
@@ -231,6 +242,9 @@ func (g *Game) Update() error {
 	// Update feedback animations
 	g.feedback.Update()
 
+	// Update glass effect animation
+	g.glass.Update()
+
 	// Handle welcome screen first (blocks other input)
 	if g.welcomeScreen.IsVisible() {
 		g.welcomeScreen.Update(g.input)
@@ -292,6 +306,10 @@ func (g *Game) updateCursor() {
 
 // Draw renders the game.
 func (g *Game) Draw(screen *ebiten.Image) {
+	// Set HiDPI scale factor for all rendering components
+	g.renderer.SetScale(g.scale)
+	g.panel.SetScale(g.scale)
+
 	// Clear background
 	screen.Fill(g.renderer.Theme().Background)
 
@@ -316,24 +334,34 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	// Draw feedback overlays (animations, toasts)
-	g.feedback.Draw(screen, g.renderer)
+	g.feedback.Draw(screen, g.renderer, g.glass)
 
 	// Draw panel
-	g.panel.Draw(screen, g.renderer)
+	g.panel.Draw(screen, g.renderer, g.glass)
 
-	// Draw modals on top
-	g.settingsModal.Draw(screen)
-	g.downloader.Draw(screen)
-	g.welcomeScreen.Draw(screen)
+	// Draw modals on top (with glass effect)
+	g.settingsModal.Draw(screen, g.glass)
+	g.downloader.Draw(screen, g.glass)
+	g.welcomeScreen.Draw(screen, g.glass)
 }
 
 // Layout returns the game's screen dimensions.
 // Width is dynamic based on panel collapsed state.
+// Uses device scale factor for crisp rendering on HiDPI displays.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
-	if g.panel != nil && g.panel.Collapsed() {
-		return BoardSize + CollapsedWidth, ScreenHeight
+	// Get and store device scale factor (2.0 on Retina, 1.0 on standard displays)
+	g.scale = ebiten.Monitor().DeviceScaleFactor()
+	if g.scale < 1.0 {
+		g.scale = 1.0 // Ensure minimum scale of 1.0
 	}
-	return ScreenWidth, ScreenHeight
+
+	// Update global scale for widgets and modals
+	UIScale = g.scale
+
+	if g.panel != nil && g.panel.Collapsed() {
+		return int(float64(BoardSize+CollapsedWidth) * g.scale), int(float64(ScreenHeight) * g.scale)
+	}
+	return int(float64(ScreenWidth) * g.scale), int(float64(ScreenHeight) * g.scale)
 }
 
 // handleBoardInput processes mouse interactions with the board.

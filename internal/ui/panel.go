@@ -71,6 +71,36 @@ type Panel struct {
 	// Move history scroll
 	scrollY    int
 	maxScrollY int
+
+	// Scrollbar drag state
+	scrollDragging      bool
+	scrollDragStartY    int
+	scrollDragStartVal  int
+	scrollbarHovered    bool
+
+	// HiDPI scaling
+	scale float64
+}
+
+// SetScale sets the HiDPI scale factor for panel rendering.
+func (p *Panel) SetScale(scale float64) {
+	p.scale = scale
+}
+
+// s returns the scaled value for rendering.
+func (p *Panel) s(v int) float32 {
+	if p.scale == 0 {
+		p.scale = 1.0
+	}
+	return float32(float64(v) * p.scale)
+}
+
+// si returns the scaled int value.
+func (p *Panel) si(v int) int {
+	if p.scale == 0 {
+		p.scale = 1.0
+	}
+	return int(float64(v) * p.scale)
 }
 
 // NewPanel creates a new panel for the given game.
@@ -192,6 +222,59 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 		}
 	}
 
+	// Handle scrollbar drag
+	if p.maxScrollY > 0 {
+		historyY := p.getHistoryStartY()
+		maxY := ScreenHeight - 70
+		visibleHeight := maxY - historyY
+
+		// Calculate scrollbar indicator position and size
+		moves := p.game.SANHistory()
+		totalRows := (len(moves) + 1) / 2
+		rowHeight := 22
+		contentHeight := totalRows * rowHeight
+		indicatorH := visibleHeight * visibleHeight / contentHeight
+		if indicatorH < 20 {
+			indicatorH = 20
+		}
+		scrollPct := float64(p.scrollY) / float64(p.maxScrollY)
+		indicatorY := historyY + int(scrollPct*float64(visibleHeight-indicatorH))
+		indicatorX := BoardSize + PanelWidth - 8
+
+		// Check if mouse is over scrollbar
+		p.scrollbarHovered = mx >= indicatorX && mx < indicatorX+8 &&
+			my >= indicatorY && my < indicatorY+indicatorH
+
+		// Start drag
+		if input.IsLeftJustPressed() && p.scrollbarHovered {
+			p.scrollDragging = true
+			p.scrollDragStartY = my
+			p.scrollDragStartVal = p.scrollY
+		}
+
+		// Continue drag
+		if p.scrollDragging {
+			if input.IsLeftPressed() {
+				deltaY := my - p.scrollDragStartY
+				// Convert pixel delta to scroll amount
+				scrollRange := visibleHeight - indicatorH
+				if scrollRange > 0 {
+					p.scrollY = p.scrollDragStartVal + deltaY*p.maxScrollY/scrollRange
+				}
+				// Clamp
+				if p.scrollY < 0 {
+					p.scrollY = 0
+				}
+				if p.scrollY > p.maxScrollY {
+					p.scrollY = p.maxScrollY
+				}
+				return true
+			} else {
+				p.scrollDragging = false
+			}
+		}
+	}
+
 	// Check other buttons for hover
 	p.newGameBtn.hovered = p.isInside(mx, my, p.newGameBtn)
 	p.settingsBtn.hovered = p.isInside(mx, my, p.settingsBtn)
@@ -282,18 +365,18 @@ func (p *Panel) isInside(mx, my int, btn *Button) bool {
 }
 
 // Draw renders the panel.
-func (p *Panel) Draw(screen *ebiten.Image, r *Renderer) {
-	panelX := float32(BoardSize)
+func (p *Panel) Draw(screen *ebiten.Image, r *Renderer, glass *GlassEffect) {
+	panelX := p.s(BoardSize)
 
 	if p.collapsed {
 		// Draw collapsed state - just a thin bar with expand button
-		vector.DrawFilledRect(screen, panelX, 0, float32(CollapsedWidth), float32(ScreenHeight), panelBg, false)
+		vector.DrawFilledRect(screen, panelX, 0, p.s(CollapsedWidth), p.s(ScreenHeight), panelBg, false)
 		p.drawCollapseButton(screen, true)
 		return
 	}
 
 	// Draw panel background
-	vector.DrawFilledRect(screen, panelX, 0, float32(PanelWidth), float32(ScreenHeight), panelBg, false)
+	vector.DrawFilledRect(screen, panelX, 0, p.s(PanelWidth), p.s(ScreenHeight), panelBg, false)
 
 	// Draw collapse button
 	p.drawCollapseButton(screen, false)
@@ -321,8 +404,8 @@ func (p *Panel) Draw(screen *ebiten.Image, r *Renderer) {
 	p.drawSectionLabel(screen, "Moves", BoardSize+PanelPadding, historyY)
 	p.drawMoveHistory(screen, historyY+SectionLabelH+4)
 
-	// Draw status bar at bottom
-	p.drawStatusBar(screen)
+	// Draw status bar at bottom with glass effect
+	p.drawStatusBar(screen, glass)
 }
 
 func (p *Panel) getHistoryStartY() int {
@@ -342,7 +425,7 @@ func (p *Panel) drawCollapseButton(screen *ebiten.Image, expand bool) {
 	}
 
 	// Draw as integrated tab (no border, blends with panel)
-	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+	vector.DrawFilledRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), bgColor, false)
 
 	// Draw arrow - muted by default, bright on hover
 	arrow := "‹"
@@ -365,14 +448,14 @@ func (p *Panel) drawPrimaryButton(screen *ebiten.Image, btn *Button) {
 	}
 
 	// Draw button background
-	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+	vector.DrawFilledRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), bgColor, false)
 
 	// Draw border for depth
 	borderC := color.RGBA{56, 155, 100, 255}
 	if btn.hovered {
 		borderC = color.RGBA{116, 215, 160, 255} // Lighter border on hover
 	}
-	vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
+	vector.StrokeRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), float32(p.scale), borderC, false)
 
 	// Draw label
 	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textPrimary)
@@ -387,14 +470,14 @@ func (p *Panel) drawSecondaryButton(screen *ebiten.Image, btn *Button) {
 	}
 
 	// Draw button background
-	vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+	vector.DrawFilledRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), bgColor, false)
 
 	// Draw border
 	borderC := buttonBorder
 	if btn.hovered {
 		borderC = accentColor // Green border on hover
 	}
-	vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
+	vector.StrokeRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), float32(p.scale), borderC, false)
 
 	p.drawTextCentered(screen, btn.Label, btn.X+btn.W/2, btn.Y+btn.H/2, textSecondary)
 }
@@ -414,7 +497,7 @@ func (p *Panel) drawModeTabs(screen *ebiten.Image) {
 		}
 
 		// Draw background
-		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+		vector.DrawFilledRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), bgColor, false)
 
 		// Draw border - highlight on hover, green on active
 		borderC := buttonBorder
@@ -423,7 +506,7 @@ func (p *Panel) drawModeTabs(screen *ebiten.Image) {
 		} else if btn.hovered {
 			borderC = accentColor
 		}
-		vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
+		vector.StrokeRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), float32(p.scale), borderC, false)
 
 		textColor := textSecondary
 		if isActive {
@@ -447,7 +530,7 @@ func (p *Panel) drawDifficultyTabs(screen *ebiten.Image) {
 		}
 
 		// Draw background
-		vector.DrawFilledRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), bgColor, false)
+		vector.DrawFilledRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), bgColor, false)
 
 		// Draw border - highlight on hover, green on active
 		borderC := buttonBorder
@@ -456,7 +539,7 @@ func (p *Panel) drawDifficultyTabs(screen *ebiten.Image) {
 		} else if btn.hovered {
 			borderC = accentColor
 		}
-		vector.StrokeRect(screen, float32(btn.X), float32(btn.Y), float32(btn.W), float32(btn.H), 1, borderC, false)
+		vector.StrokeRect(screen, p.s(btn.X), p.s(btn.Y), p.s(btn.W), p.s(btn.H), float32(p.scale), borderC, false)
 
 		textColor := textSecondary
 		if isActive {
@@ -519,8 +602,8 @@ func (p *Panel) drawMoveHistory(screen *ebiten.Image, startY int) {
 			if bgY < startY {
 				bgY = startY
 			}
-			vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding-4), float32(bgY),
-				float32(PanelWidth-PanelPadding*2+8), float32(rowHeight), moveRowAlt, false)
+			vector.DrawFilledRect(screen, p.s(BoardSize+PanelPadding-4), p.s(bgY),
+				p.s(PanelWidth-PanelPadding*2+8), p.s(rowHeight), moveRowAlt, false)
 		}
 
 		// Only draw text if within visible bounds
@@ -541,23 +624,46 @@ func (p *Panel) drawMoveHistory(screen *ebiten.Image, startY int) {
 	if p.maxScrollY > 0 {
 		// Draw a small scroll indicator on the right
 		scrollPct := float32(p.scrollY) / float32(p.maxScrollY)
-		indicatorH := float32(visibleHeight) * float32(visibleHeight) / float32(contentHeight)
-		if indicatorH < 20 {
-			indicatorH = 20
+		indicatorH := p.s(visibleHeight) * float32(visibleHeight) / float32(contentHeight)
+		if indicatorH < p.s(20) {
+			indicatorH = p.s(20)
 		}
-		indicatorY := float32(startY) + scrollPct*(float32(visibleHeight)-indicatorH)
-		indicatorX := float32(BoardSize + PanelWidth - 8)
-		vector.DrawFilledRect(screen, indicatorX, indicatorY, 4, indicatorH, textMuted, false)
+		indicatorY := p.s(startY) + scrollPct*(p.s(visibleHeight)-indicatorH)
+		indicatorX := p.s(BoardSize + PanelWidth - 8)
+
+		// Color based on state: dragging > hovered > normal
+		scrollColor := textMuted
+		if p.scrollDragging {
+			scrollColor = accentColor
+		} else if p.scrollbarHovered {
+			scrollColor = textSecondary
+		}
+		vector.DrawFilledRect(screen, indicatorX, indicatorY, p.s(4), indicatorH, scrollColor, false)
 	}
 }
 
-func (p *Panel) drawStatusBar(screen *ebiten.Image) {
+func (p *Panel) drawStatusBar(screen *ebiten.Image, glass *GlassEffect) {
 	statusY := ScreenHeight - 70
 	x := BoardSize + PanelPadding
 
-	// Draw divider
-	vector.DrawFilledRect(screen, float32(BoardSize+PanelPadding), float32(statusY-10),
-		float32(PanelWidth-PanelPadding*2), 1, dividerColor, false)
+	// Draw liquid glass effect background for status bar
+	if glass != nil && glass.IsEnabled() {
+		tint := color.RGBA{30, 32, 38, 80} // Dark tint, low alpha for subtle effect
+		glass.DrawGlass(screen,
+			p.si(BoardSize), p.si(statusY-14),
+			p.si(PanelWidth), p.si(84),
+			tint, 2.0, 3.0) // sigma=2.0, refraction=3.0
+	} else {
+		// Fallback: semi-transparent background
+		glassBg := color.RGBA{30, 32, 38, 230}
+		vector.DrawFilledRect(screen, p.s(BoardSize), p.s(statusY-14),
+			p.s(PanelWidth), p.s(84), glassBg, false)
+	}
+
+	// Top border for separation (subtle glow effect)
+	borderC := color.RGBA{60, 65, 72, 200}
+	vector.DrawFilledRect(screen, p.s(BoardSize+PanelPadding), p.s(statusY-14),
+		p.s(PanelWidth-PanelPadding*2), p.s(1), borderC, false)
 
 	// Draw player name and eval mode
 	username := p.game.Username()
@@ -604,7 +710,7 @@ func (p *Panel) drawText(screen *ebiten.Image, s string, x, y int, c color.Color
 		return
 	}
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(float64(x), float64(y))
+	op.GeoM.Translate(float64(p.si(x)), float64(p.si(y)))
 	op.ColorScale.ScaleWithColor(c)
 	text.Draw(screen, s, face, op)
 }
@@ -615,8 +721,8 @@ func (p *Panel) drawTextCentered(screen *ebiten.Image, s string, centerX, center
 		return
 	}
 	w, h := MeasureText(s, face)
-	x := float64(centerX) - w/2
-	y := float64(centerY) - h/2
+	x := float64(p.si(centerX)) - w/2
+	y := float64(p.si(centerY)) - h/2
 	op := &text.DrawOptions{}
 	op.GeoM.Translate(x, y)
 	op.ColorScale.ScaleWithColor(c)
@@ -633,7 +739,7 @@ func (p *Panel) toggleCollapse() {
 	p.collapsed = !p.collapsed
 	p.createButtons()
 
-	// Resize window to match new layout
+	// Resize window to match new layout (no need to scale - SetWindowSize uses logical size)
 	if p.collapsed {
 		ebiten.SetWindowSize(BoardSize+CollapsedWidth, ScreenHeight)
 	} else {

@@ -44,6 +44,7 @@ type Renderer struct {
 	theme      *Theme
 	boardSize  int
 	squareSize int
+	scale      float64 // HiDPI scale factor
 }
 
 // NewRenderer creates a new renderer.
@@ -53,15 +54,32 @@ func NewRenderer(boardSize, squareSize int) *Renderer {
 		theme:      DefaultTheme(),
 		boardSize:  boardSize,
 		squareSize: squareSize,
+		scale:      1.0,
 	}
+}
+
+// SetScale sets the HiDPI scale factor for rendering.
+func (r *Renderer) SetScale(scale float64) {
+	r.scale = scale
+	r.sprites.SetScale(scale)
+}
+
+// s returns the scaled value for rendering.
+func (r *Renderer) s(v int) float32 {
+	return float32(float64(v) * r.scale)
+}
+
+// sf returns the scaled float value for rendering.
+func (r *Renderer) sf(v float32) float32 {
+	return v * float32(r.scale)
 }
 
 // DrawBoard draws the chess board squares.
 func (r *Renderer) DrawBoard(screen *ebiten.Image) {
 	for rank := 0; rank < 8; rank++ {
 		for file := 0; file < 8; file++ {
-			x := float32(file * r.squareSize)
-			y := float32((7 - rank) * r.squareSize) // Flip so rank 1 is at bottom
+			x := r.s(file * r.squareSize)
+			y := r.s((7 - rank) * r.squareSize) // Flip so rank 1 is at bottom
 
 			var c color.RGBA
 			if (rank+file)%2 == 0 {
@@ -70,7 +88,7 @@ func (r *Renderer) DrawBoard(screen *ebiten.Image) {
 				c = r.theme.LightSquare
 			}
 
-			vector.DrawFilledRect(screen, x, y, float32(r.squareSize), float32(r.squareSize), c, false)
+			vector.DrawFilledRect(screen, x, y, r.s(r.squareSize), r.s(r.squareSize), c, false)
 		}
 	}
 
@@ -119,15 +137,15 @@ func (r *Renderer) highlightSquare(screen *ebiten.Image, sq board.Square, c colo
 		return
 	}
 	x, y := r.SquareToScreen(sq)
-	vector.DrawFilledRect(screen, float32(x), float32(y), float32(r.squareSize), float32(r.squareSize), c, false)
+	vector.DrawFilledRect(screen, r.s(x), r.s(y), r.s(r.squareSize), r.s(r.squareSize), c, false)
 }
 
 // drawLegalMoveIndicator draws a circle on legal move squares.
 func (r *Renderer) drawLegalMoveIndicator(screen *ebiten.Image, sq board.Square) {
 	x, y := r.SquareToScreen(sq)
-	cx := float32(x) + float32(r.squareSize)/2
-	cy := float32(y) + float32(r.squareSize)/2
-	radius := float32(r.squareSize) * 0.15
+	cx := r.s(x) + r.s(r.squareSize)/2
+	cy := r.s(y) + r.s(r.squareSize)/2
+	radius := r.s(r.squareSize) * 0.15
 
 	vector.DrawFilledCircle(screen, cx, cy, radius, r.theme.LegalMoveColor, false)
 }
@@ -159,19 +177,22 @@ func (r *Renderer) DrawPiecesWithAnimations(screen *ebiten.Image, pos *board.Pos
 			y += int(offsetY)
 		}
 
-		r.sprites.DrawPieceAt(screen, piece, x, y)
+		// Scale coordinates for HiDPI
+		r.sprites.DrawPieceAt(screen, piece, int(r.s(x)), int(r.s(y)))
 	}
 }
 
 // DrawDraggedPiece draws the piece being dragged at the mouse position.
+// mouseX, mouseY are in logical coordinates (will be scaled for drawing).
 func (r *Renderer) DrawDraggedPiece(screen *ebiten.Image, piece board.Piece, mouseX, mouseY int) {
 	if piece == board.NoPiece {
 		return
 	}
 
-	// Center the piece on the cursor
-	x := mouseX - r.squareSize/2
-	y := mouseY - r.squareSize/2
+	// Scale mouse position for drawing and center the piece on the cursor
+	halfSize := int(r.s(r.squareSize)) / 2
+	x := int(r.s(mouseX)) - halfSize
+	y := int(r.s(mouseY)) - halfSize
 
 	r.sprites.DrawPieceAt(screen, piece, x, y)
 }

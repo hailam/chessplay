@@ -135,19 +135,26 @@ func (ws *WelcomeScreen) AnyButtonHovered() bool {
 }
 
 // Draw renders the welcome screen.
-func (ws *WelcomeScreen) Draw(screen *ebiten.Image) {
+func (ws *WelcomeScreen) Draw(screen *ebiten.Image, glass *GlassEffect) {
 	if !ws.visible {
 		return
 	}
 
-	// Semi-transparent overlay
-	vector.DrawFilledRect(screen, 0, 0, float32(ScreenWidth), float32(ScreenHeight), modalOverlay, false)
+	// Full-screen blur overlay with glass effect
+	if glass != nil && glass.IsEnabled() {
+		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
+		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
+			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+	} else {
+		// Fallback: semi-transparent overlay
+		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)
+	}
 
 	// Modal background
-	vector.DrawFilledRect(screen, float32(ws.x), float32(ws.y), float32(WelcomeWidth), float32(WelcomeHeight), modalBg, false)
+	vector.DrawFilledRect(screen, scaleF(ws.x), scaleF(ws.y), scaleF(WelcomeWidth), scaleF(WelcomeHeight), modalBg, false)
 
 	// Modal border
-	vector.StrokeRect(screen, float32(ws.x), float32(ws.y), float32(WelcomeWidth), float32(WelcomeHeight), 2, modalBorder, false)
+	vector.StrokeRect(screen, scaleF(ws.x), scaleF(ws.y), scaleF(WelcomeWidth), scaleF(WelcomeHeight), float32(UIScale*2), modalBorder, false)
 
 	// Draw chess piece icon (king)
 	ws.drawChessIcon(screen)
@@ -174,18 +181,18 @@ func (ws *WelcomeScreen) Draw(screen *ebiten.Image) {
 // drawChessIcon draws a decorative chess icon.
 func (ws *WelcomeScreen) drawChessIcon(screen *ebiten.Image) {
 	// Draw a simple crown-like shape for the king
-	centerX := float32(ws.x + WelcomeWidth/2)
-	y := float32(ws.y + 28)
+	centerX := scaleF(ws.x + WelcomeWidth/2)
+	y := scaleF(ws.y + 28)
 
 	iconColor := accentColor
 
 	// Simple crown/king icon using circles and rectangles
-	vector.DrawFilledCircle(screen, centerX, y+8, 6, iconColor, false)
-	vector.DrawFilledRect(screen, centerX-8, y+10, 16, 14, iconColor, false)
+	vector.DrawFilledCircle(screen, centerX, y+scaleF(8), scaleF(6), iconColor, false)
+	vector.DrawFilledRect(screen, centerX-scaleF(8), y+scaleF(10), scaleF(16), scaleF(14), iconColor, false)
 
 	// Cross on top
-	vector.DrawFilledRect(screen, centerX-1, y-2, 3, 10, iconColor, false)
-	vector.DrawFilledRect(screen, centerX-4, y+2, 9, 3, iconColor, false)
+	vector.DrawFilledRect(screen, centerX-scaleF(1), y-scaleF(2), scaleF(3), scaleF(10), iconColor, false)
+	vector.DrawFilledRect(screen, centerX-scaleF(4), y+scaleF(2), scaleF(9), scaleF(3), iconColor, false)
 }
 
 // drawTitle draws the main title.
@@ -197,10 +204,10 @@ func (ws *WelcomeScreen) drawTitle(screen *ebiten.Image) {
 
 	title := "CHESSPLAY"
 	w, _ := MeasureText(title, face)
-	centerX := float64(ws.x) + float64(WelcomeWidth)/2 - w/2
+	centerX := scaleD(ws.x) + scaleD(WelcomeWidth)/2 - w/2
 
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(centerX, float64(ws.y+64))
+	op.GeoM.Translate(centerX, scaleD(ws.y+64))
 	op.ColorScale.ScaleWithColor(textPrimary)
 	text.Draw(screen, title, face, op)
 }
@@ -214,10 +221,10 @@ func (ws *WelcomeScreen) drawSubtitle(screen *ebiten.Image) {
 
 	subtitle := "Welcome! Set up your preferences."
 	w, _ := MeasureText(subtitle, face)
-	centerX := float64(ws.x) + float64(WelcomeWidth)/2 - w/2
+	centerX := scaleD(ws.x) + scaleD(WelcomeWidth)/2 - w/2
 
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(centerX, float64(ws.y+96))
+	op.GeoM.Translate(centerX, scaleD(ws.y+96))
 	op.ColorScale.ScaleWithColor(textSecondary)
 	text.Draw(screen, subtitle, face, op)
 }
@@ -229,7 +236,7 @@ func (ws *WelcomeScreen) drawSectionLabel(screen *ebiten.Image, label string, x,
 		return
 	}
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(float64(x), float64(y))
+	op.GeoM.Translate(scaleD(x), scaleD(y))
 	op.ColorScale.ScaleWithColor(color.RGBA{160, 165, 175, 255})
 	text.Draw(screen, label, face, op)
 }

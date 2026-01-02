@@ -18,20 +18,27 @@ var pieceAssets embed.FS
 
 // SpriteManager manages piece sprites.
 type SpriteManager struct {
-	pieces      map[board.Piece]*ebiten.Image
-	size        int     // Display size (e.g., 80)
-	renderScale float64 // Render at higher resolution for quality (e.g., 3.0)
+	pieces       map[board.Piece]*ebiten.Image
+	size         int     // Display size (e.g., 80)
+	renderScale  float64 // Render at higher resolution for quality (e.g., 3.0)
+	displayScale float64 // HiDPI display scale factor
 }
 
 // NewSpriteManager creates a new sprite manager with pieces of the given size.
 func NewSpriteManager(size int) *SpriteManager {
 	sm := &SpriteManager{
-		pieces:      make(map[board.Piece]*ebiten.Image),
-		size:        size,
-		renderScale: 3.0, // Render at 3x resolution for sharp scaling
+		pieces:       make(map[board.Piece]*ebiten.Image),
+		size:         size,
+		renderScale:  3.0, // Render at 3x resolution for sharp scaling
+		displayScale: 1.0,
 	}
 	sm.loadPieces()
 	return sm
+}
+
+// SetScale sets the HiDPI display scale factor.
+func (sm *SpriteManager) SetScale(scale float64) {
+	sm.displayScale = scale
 }
 
 // GetPiece returns the sprite for a piece.
@@ -87,7 +94,7 @@ func (sm *SpriteManager) loadPieces() {
 	}
 }
 
-// DrawPieceAt draws a piece at the given pixel coordinates.
+// DrawPieceAt draws a piece at the given pixel coordinates (already scaled for HiDPI).
 func (sm *SpriteManager) DrawPieceAt(screen *ebiten.Image, p board.Piece, x, y int) {
 	if p == board.NoPiece {
 		return
@@ -97,8 +104,9 @@ func (sm *SpriteManager) DrawPieceAt(screen *ebiten.Image, p board.Piece, x, y i
 		return
 	}
 	op := &ebiten.DrawImageOptions{}
-	// Scale down from render resolution to display size
-	scale := 1.0 / sm.renderScale
+	// Scale: render resolution -> display size -> HiDPI
+	// Combined scale = displayScale / renderScale
+	scale := sm.displayScale / sm.renderScale
 	op.GeoM.Scale(scale, scale)
 	op.GeoM.Translate(float64(x), float64(y))
 	// Use linear filtering for smooth scaling

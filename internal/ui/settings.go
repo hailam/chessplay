@@ -208,22 +208,29 @@ func (sm *SettingsModal) AnyButtonHovered() bool {
 }
 
 // Draw renders the settings modal.
-func (sm *SettingsModal) Draw(screen *ebiten.Image) {
+func (sm *SettingsModal) Draw(screen *ebiten.Image, glass *GlassEffect) {
 	if !sm.visible {
 		return
 	}
 
-	// Semi-transparent overlay
-	vector.DrawFilledRect(screen, 0, 0, float32(ScreenWidth), float32(ScreenHeight), modalOverlay, false)
+	// Full-screen blur overlay with glass effect
+	if glass != nil && glass.IsEnabled() {
+		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
+		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
+			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+	} else {
+		// Fallback: semi-transparent overlay
+		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)
+	}
 
 	// Modal background
-	vector.DrawFilledRect(screen, float32(sm.x), float32(sm.y), float32(SettingsWidth), float32(SettingsHeight), modalBg, false)
+	vector.DrawFilledRect(screen, scaleF(sm.x), scaleF(sm.y), scaleF(SettingsWidth), scaleF(SettingsHeight), modalBg, false)
 
 	// Modal border
-	vector.StrokeRect(screen, float32(sm.x), float32(sm.y), float32(SettingsWidth), float32(SettingsHeight), 2, modalBorder, false)
+	vector.StrokeRect(screen, scaleF(sm.x), scaleF(sm.y), scaleF(SettingsWidth), scaleF(SettingsHeight), float32(UIScale*2), modalBorder, false)
 
 	// Header background
-	vector.DrawFilledRect(screen, float32(sm.x), float32(sm.y), float32(SettingsWidth), 44, modalHeader, false)
+	vector.DrawFilledRect(screen, scaleF(sm.x), scaleF(sm.y), scaleF(SettingsWidth), scaleF(44), modalHeader, false)
 
 	// Header title
 	sm.drawTitle(screen)
@@ -253,8 +260,8 @@ func (sm *SettingsModal) drawTitle(screen *ebiten.Image) {
 
 	title := "Settings"
 	w, h := MeasureText(title, face)
-	centerX := float64(sm.x) + float64(SettingsWidth)/2 - w/2
-	centerY := float64(sm.y) + 22 - h/2
+	centerX := scaleD(sm.x) + scaleD(SettingsWidth)/2 - w/2
+	centerY := scaleD(sm.y) + scaleD(22) - h/2
 
 	op := &text.DrawOptions{}
 	op.GeoM.Translate(centerX, centerY)
@@ -269,7 +276,7 @@ func (sm *SettingsModal) drawSectionLabel(screen *ebiten.Image, label string, x,
 		return
 	}
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(float64(x), float64(y))
+	op.GeoM.Translate(scaleD(x), scaleD(y))
 	op.ColorScale.ScaleWithColor(textMuted)
 	text.Draw(screen, label, face, op)
 }

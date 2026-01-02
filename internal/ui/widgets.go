@@ -23,6 +23,21 @@ var (
 	inputPlaceholder  = color.RGBA{120, 125, 135, 255}
 )
 
+// scaleF returns the scaled float32 value for rendering.
+func scaleF(v int) float32 {
+	return float32(float64(v) * UIScale)
+}
+
+// scaleI returns the scaled int value.
+func scaleI(v int) int {
+	return int(float64(v) * UIScale)
+}
+
+// scaleD returns the scaled float64 value.
+func scaleD(v int) float64 {
+	return float64(v) * UIScale
+}
+
 // TextInput is an editable text field widget.
 type TextInput struct {
 	X, Y, W, H   int
@@ -93,7 +108,7 @@ func (ti *TextInput) Draw(screen *ebiten.Image) {
 	if ti.hovered && !ti.focused {
 		bgColor = color.RGBA{52, 56, 62, 255}
 	}
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), float32(ti.W), float32(ti.H), bgColor, false)
+	vector.DrawFilledRect(screen, scaleF(ti.X), scaleF(ti.Y), scaleF(ti.W), scaleF(ti.H), bgColor, false)
 
 	// Border - accent on hover/focus
 	borderColor := widgetBorder
@@ -102,7 +117,7 @@ func (ti *TextInput) Draw(screen *ebiten.Image) {
 	} else if ti.hovered {
 		borderColor = accentColor
 	}
-	vector.StrokeRect(screen, float32(ti.X), float32(ti.Y), float32(ti.W), float32(ti.H), 2, borderColor, false)
+	vector.StrokeRect(screen, scaleF(ti.X), scaleF(ti.Y), scaleF(ti.W), scaleF(ti.H), float32(UIScale*2), borderColor, false)
 
 	// Text or placeholder
 	face := GetRegularFace()
@@ -116,26 +131,26 @@ func (ti *TextInput) Draw(screen *ebiten.Image) {
 	if ti.Value != "" {
 		op := &text.DrawOptions{}
 		_, h := MeasureText(ti.Value, face)
-		op.GeoM.Translate(float64(textX), float64(textY)-h/2)
+		op.GeoM.Translate(scaleD(textX), scaleD(textY)-h/2)
 		op.ColorScale.ScaleWithColor(inputTextColor)
 		text.Draw(screen, ti.Value, face, op)
 
 		// Cursor
 		if ti.focused && ti.cursorBlink < 30 {
 			w, _ := MeasureText(ti.Value, face)
-			cursorX := float32(textX) + float32(w) + 2
-			vector.DrawFilledRect(screen, cursorX, float32(ti.Y+8), 2, float32(ti.H-16), inputTextColor, false)
+			cursorX := scaleF(textX) + float32(w) + 2
+			vector.DrawFilledRect(screen, cursorX, scaleF(ti.Y+8), scaleF(2), scaleF(ti.H-16), inputTextColor, false)
 		}
 	} else if ti.Placeholder != "" {
 		op := &text.DrawOptions{}
 		_, h := MeasureText(ti.Placeholder, face)
-		op.GeoM.Translate(float64(textX), float64(textY)-h/2)
+		op.GeoM.Translate(scaleD(textX), scaleD(textY)-h/2)
 		op.ColorScale.ScaleWithColor(inputPlaceholder)
 		text.Draw(screen, ti.Placeholder, face, op)
 
 		// Cursor when focused and empty
 		if ti.focused && ti.cursorBlink < 30 {
-			vector.DrawFilledRect(screen, float32(textX), float32(ti.Y+8), 2, float32(ti.H-16), inputTextColor, false)
+			vector.DrawFilledRect(screen, scaleF(textX), scaleF(ti.Y+8), scaleF(2), scaleF(ti.H-16), inputTextColor, false)
 		}
 	}
 }
@@ -210,13 +225,13 @@ func (rg *RadioGroup) Draw(screen *ebiten.Image) {
 		// Draw hover background
 		if isHovered && !isSelected {
 			hoverBg := color.RGBA{55, 60, 68, 255}
-			vector.DrawFilledRect(screen, float32(rg.X-4), float32(itemY), 200, float32(rg.ItemH), hoverBg, false)
+			vector.DrawFilledRect(screen, scaleF(rg.X-4), scaleF(itemY), scaleF(200), scaleF(rg.ItemH), hoverBg, false)
 		}
 
 		// Radio circle
-		cx := float32(rg.X + 10)
-		cy := float32(itemY + rg.ItemH/2)
-		radius := float32(8)
+		cx := scaleF(rg.X + 10)
+		cy := scaleF(itemY + rg.ItemH/2)
+		radius := scaleF(8)
 
 		// Outer circle
 		circleColor := radioInactive
@@ -229,14 +244,14 @@ func (rg *RadioGroup) Draw(screen *ebiten.Image) {
 
 		// Inner circle for selected
 		if isSelected {
-			vector.DrawFilledCircle(screen, cx, cy, radius-4, inputTextColor, false)
+			vector.DrawFilledCircle(screen, cx, cy, radius-scaleF(4), inputTextColor, false)
 		}
 
 		// Label
 		textX := rg.X + 30
 		op := &text.DrawOptions{}
 		_, h := MeasureText(opt.Label, face)
-		op.GeoM.Translate(float64(textX), float64(itemY+rg.ItemH/2)-h/2)
+		op.GeoM.Translate(scaleD(textX), scaleD(itemY+rg.ItemH/2)-h/2)
 		textColor := textSecondary
 		if isSelected {
 			textColor = textPrimary
@@ -286,9 +301,9 @@ func (cb *Checkbox) Draw(screen *ebiten.Image) {
 	}
 
 	// Checkbox box
-	boxX := float32(cb.X)
-	boxY := float32(cb.Y)
-	boxSize := float32(20)
+	boxX := scaleF(cb.X)
+	boxY := scaleF(cb.Y)
+	boxSize := scaleF(20)
 
 	bgColor := widgetBg
 	if cb.hovered {
@@ -303,20 +318,20 @@ func (cb *Checkbox) Draw(screen *ebiten.Image) {
 	} else if cb.Checked {
 		borderC = checkboxCheck
 	}
-	vector.StrokeRect(screen, boxX, boxY, boxSize, boxSize, 2, borderC, false)
+	vector.StrokeRect(screen, boxX, boxY, boxSize, boxSize, float32(UIScale*2), borderC, false)
 
 	// Checkmark
 	if cb.Checked {
 		// Draw a simple checkmark using lines
-		vector.StrokeLine(screen, boxX+4, boxY+10, boxX+8, boxY+14, 2, checkboxCheck, false)
-		vector.StrokeLine(screen, boxX+8, boxY+14, boxX+16, boxY+6, 2, checkboxCheck, false)
+		vector.StrokeLine(screen, boxX+scaleF(4), boxY+scaleF(10), boxX+scaleF(8), boxY+scaleF(14), float32(UIScale*2), checkboxCheck, false)
+		vector.StrokeLine(screen, boxX+scaleF(8), boxY+scaleF(14), boxX+scaleF(16), boxY+scaleF(6), float32(UIScale*2), checkboxCheck, false)
 	}
 
 	// Label
 	textX := cb.X + 30
 	op := &text.DrawOptions{}
 	_, h := MeasureText(cb.Label, face)
-	op.GeoM.Translate(float64(textX), float64(cb.Y+10)-h/2)
+	op.GeoM.Translate(scaleD(textX), scaleD(cb.Y+10)-h/2)
 	textColor := textSecondary
 	if cb.Checked {
 		textColor = textPrimary
@@ -395,15 +410,15 @@ func (bg *ButtonGroup) Draw(screen *ebiten.Image) {
 		isPressed := i == bg.pressed
 
 		// Button background
-		bgColor := tabInactive
+		bgC := tabInactive
 		if isSelected {
-			bgColor = tabActive
+			bgC = tabActive
 		} else if isPressed {
-			bgColor = tabPressed
+			bgC = tabPressed
 		} else if isHovered {
-			bgColor = tabHover
+			bgC = tabHover
 		}
-		vector.DrawFilledRect(screen, float32(btnX), float32(bg.Y), float32(bg.ButtonW), float32(bg.ButtonH), bgColor, false)
+		vector.DrawFilledRect(screen, scaleF(btnX), scaleF(bg.Y), scaleF(bg.ButtonW), scaleF(bg.ButtonH), bgC, false)
 
 		// Border - accent on hover, match bg on selected
 		bordC := borderColor
@@ -412,12 +427,12 @@ func (bg *ButtonGroup) Draw(screen *ebiten.Image) {
 		} else if isHovered {
 			bordC = accentColor
 		}
-		vector.StrokeRect(screen, float32(btnX), float32(bg.Y), float32(bg.ButtonW), float32(bg.ButtonH), 1, bordC, false)
+		vector.StrokeRect(screen, scaleF(btnX), scaleF(bg.Y), scaleF(bg.ButtonW), scaleF(bg.ButtonH), float32(UIScale), bordC, false)
 
 		// Label
 		w, h := MeasureText(label, face)
-		centerX := float64(btnX) + float64(bg.ButtonW)/2 - w/2
-		centerY := float64(bg.Y) + float64(bg.ButtonH)/2 - h/2
+		centerX := scaleD(btnX) + scaleD(bg.ButtonW)/2 - w/2
+		centerY := scaleD(bg.Y) + scaleD(bg.ButtonH)/2 - h/2
 		op := &text.DrawOptions{}
 		op.GeoM.Translate(centerX, centerY)
 		textColor := textSecondary
@@ -499,15 +514,15 @@ func (mb *ModalButton) Draw(screen *ebiten.Image) {
 	}
 
 	// Draw background
-	vector.DrawFilledRect(screen, float32(mb.X), float32(mb.Y), float32(mb.W), float32(mb.H), bgColor, false)
+	vector.DrawFilledRect(screen, scaleF(mb.X), scaleF(mb.Y), scaleF(mb.W), scaleF(mb.H), bgColor, false)
 
 	// Draw border
-	vector.StrokeRect(screen, float32(mb.X), float32(mb.Y), float32(mb.W), float32(mb.H), 1, borderC, false)
+	vector.StrokeRect(screen, scaleF(mb.X), scaleF(mb.Y), scaleF(mb.W), scaleF(mb.H), float32(UIScale), borderC, false)
 
 	// Label
 	w, h := MeasureText(mb.Label, face)
-	centerX := float64(mb.X) + float64(mb.W)/2 - w/2
-	centerY := float64(mb.Y) + float64(mb.H)/2 - h/2
+	centerX := scaleD(mb.X) + scaleD(mb.W)/2 - w/2
+	centerY := scaleD(mb.Y) + scaleD(mb.H)/2 - h/2
 	op := &text.DrawOptions{}
 	op.GeoM.Translate(centerX, centerY)
 	op.ColorScale.ScaleWithColor(textPrimary)
@@ -516,7 +531,7 @@ func (mb *ModalButton) Draw(screen *ebiten.Image) {
 
 // Divider draws a horizontal divider line.
 func DrawDivider(screen *ebiten.Image, x, y, w int) {
-	vector.DrawFilledRect(screen, float32(x), float32(y), float32(w), 1, dividerColor, false)
+	vector.DrawFilledRect(screen, scaleF(x), scaleF(y), scaleF(w), float32(UIScale), dividerColor, false)
 }
 
 // SectionHeader draws a section header with label.
@@ -527,7 +542,7 @@ func DrawSectionHeader(screen *ebiten.Image, label string, x, y int) {
 	}
 	op := &text.DrawOptions{}
 	_, h := MeasureText(label, face)
-	op.GeoM.Translate(float64(x), float64(y)-h/2)
+	op.GeoM.Translate(scaleD(x), scaleD(y)-h/2)
 	op.ColorScale.ScaleWithColor(textMuted)
 	text.Draw(screen, label, face, op)
 }

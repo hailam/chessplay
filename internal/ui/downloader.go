@@ -284,17 +284,24 @@ func (d *Downloader) Update(input *InputHandler) bool {
 }
 
 // Draw renders the downloader.
-func (d *Downloader) Draw(screen *ebiten.Image) {
+func (d *Downloader) Draw(screen *ebiten.Image, glass *GlassEffect) {
 	if !d.visible {
 		return
 	}
 
-	// Semi-transparent overlay
-	vector.DrawFilledRect(screen, 0, 0, float32(ScreenWidth), float32(ScreenHeight), modalOverlay, false)
+	// Full-screen blur overlay with glass effect
+	if glass != nil && glass.IsEnabled() {
+		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
+		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
+			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+	} else {
+		// Fallback: semi-transparent overlay
+		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)
+	}
 
 	// Modal background
-	vector.DrawFilledRect(screen, float32(d.x), float32(d.y), float32(DownloaderWidth), float32(DownloaderHeight), modalBg, false)
-	vector.StrokeRect(screen, float32(d.x), float32(d.y), float32(DownloaderWidth), float32(DownloaderHeight), 2, modalBorder, false)
+	vector.DrawFilledRect(screen, scaleF(d.x), scaleF(d.y), scaleF(DownloaderWidth), scaleF(DownloaderHeight), modalBg, false)
+	vector.StrokeRect(screen, scaleF(d.x), scaleF(d.y), scaleF(DownloaderWidth), scaleF(DownloaderHeight), float32(UIScale*2), modalBorder, false)
 
 	// Get current progress
 	d.mu.RLock()
@@ -331,14 +338,14 @@ func (d *Downloader) drawInProgress(screen *ebiten.Image, x, y int, progress Dow
 	barH := 24
 
 	// Background
-	vector.DrawFilledRect(screen, float32(barX), float32(barY), float32(barW), float32(barH), widgetBg, false)
-	vector.StrokeRect(screen, float32(barX), float32(barY), float32(barW), float32(barH), 1, widgetBorder, false)
+	vector.DrawFilledRect(screen, scaleF(barX), scaleF(barY), scaleF(barW), scaleF(barH), widgetBg, false)
+	vector.StrokeRect(screen, scaleF(barX), scaleF(barY), scaleF(barW), scaleF(barH), float32(UIScale), widgetBorder, false)
 
 	// Progress fill
 	if progress.TotalBytes > 0 {
 		progressPct := float32(progress.BytesReceived) / float32(progress.TotalBytes)
-		fillW := float32(barW-4) * progressPct
-		vector.DrawFilledRect(screen, float32(barX+2), float32(barY+2), fillW, float32(barH-4), accentColor, false)
+		fillW := scaleF(barW-4) * progressPct
+		vector.DrawFilledRect(screen, scaleF(barX+2), scaleF(barY+2), fillW, scaleF(barH-4), accentColor, false)
 	}
 
 	// Percentage text
@@ -388,7 +395,7 @@ func (d *Downloader) drawError(screen *ebiten.Image, x, y int, progress Download
 func (d *Downloader) drawCenteredText(screen *ebiten.Image, s string, centerX, centerY int, c color.Color, face *text.GoTextFace) {
 	w, h := MeasureText(s, face)
 	op := &text.DrawOptions{}
-	op.GeoM.Translate(float64(centerX)-w/2, float64(centerY)-h/2)
+	op.GeoM.Translate(scaleD(centerX)-w/2, scaleD(centerY)-h/2)
 	op.ColorScale.ScaleWithColor(c)
 	text.Draw(screen, s, face, op)
 }

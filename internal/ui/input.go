@@ -7,7 +7,7 @@ import (
 
 // InputHandler manages mouse and keyboard input.
 type InputHandler struct {
-	mouseX, mouseY   int
+	mouseX, mouseY   int // Logical coordinates (unscaled)
 	leftPressed      bool
 	leftJustPressed  bool
 	leftJustReleased bool
@@ -20,13 +20,23 @@ func NewInputHandler() *InputHandler {
 
 // Update updates the input state. Call this once per frame.
 func (ih *InputHandler) Update() {
-	ih.mouseX, ih.mouseY = ebiten.CursorPosition()
+	// Get raw cursor position (in scaled space)
+	rawX, rawY := ebiten.CursorPosition()
+
+	// Convert to logical coordinates by dividing by scale
+	scale := UIScale
+	if scale < 1.0 {
+		scale = 1.0
+	}
+	ih.mouseX = int(float64(rawX) / scale)
+	ih.mouseY = int(float64(rawY) / scale)
+
 	ih.leftJustPressed = inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft)
 	ih.leftJustReleased = inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft)
 	ih.leftPressed = ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
 }
 
-// MousePosition returns the current mouse position.
+// MousePosition returns the current mouse position in logical coordinates.
 func (ih *InputHandler) MousePosition() (int, int) {
 	return ih.mouseX, ih.mouseY
 }
