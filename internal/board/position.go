@@ -68,6 +68,9 @@ type Position struct {
 	// Zobrist hash for transposition table
 	Hash uint64
 
+	// Pawn hash key for pawn structure caching
+	PawnKey uint64
+
 	// King positions (cached for check detection)
 	KingSquare [2]Square
 

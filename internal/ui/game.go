@@ -37,9 +37,10 @@ const (
 // Game implements ebiten.Game interface.
 type Game struct {
 	// Core game state
-	position    *board.Position
-	moveHistory []board.Move
-	sanHistory  []string
+	position       *board.Position
+	moveHistory    []board.Move
+	sanHistory     []string
+	positionHashes []uint64 // History of position hashes for repetition detection
 
 	// UI state
 	selectedSquare board.Square
@@ -88,6 +89,9 @@ func NewGame() *Game {
 	g.panel = NewPanel(g)
 	g.feedback = NewFeedbackManager()
 	g.position.UpdateCheckers()
+
+	// Initialize position hash history with starting position
+	g.positionHashes = []uint64{g.position.Hash}
 
 	return g
 }
@@ -352,6 +356,9 @@ func (g *Game) makeMove(m board.Move) {
 	g.moveHistory = append(g.moveHistory, m)
 	g.lastMove = m
 
+	// Record position hash for repetition detection
+	g.positionHashes = append(g.positionHashes, g.position.Hash)
+
 	// Clear selection
 	g.clearSelection()
 
@@ -390,6 +397,10 @@ func (g *Game) checkGameEnd() {
 		g.gameOver = true
 		g.gameResult = "Draw by stalemate"
 		g.feedback.OnStalemate()
+	} else if g.isThreefoldRepetition() {
+		g.gameOver = true
+		g.gameResult = "Draw by threefold repetition"
+		g.feedback.OnDraw("threefold repetition")
 	} else if g.position.HalfMoveClock >= 100 {
 		g.gameOver = true
 		g.gameResult = "Draw by 50-move rule"
@@ -400,12 +411,35 @@ func (g *Game) checkGameEnd() {
 	}
 }
 
+// isThreefoldRepetition checks if the current position has occurred 3 times.
+func (g *Game) isThreefoldRepetition() bool {
+	if len(g.positionHashes) < 5 {
+		// Need at least 5 positions (4 half-moves) for threefold repetition
+		return false
+	}
+
+	currentHash := g.position.Hash
+	count := 0
+	for _, h := range g.positionHashes {
+		if h == currentHash {
+			count++
+			if count >= 3 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // startAIThinking starts the AI search in a goroutine.
 func (g *Game) startAIThinking() {
 	g.aiThinking = true
 
 	// Copy position for the search
 	pos := g.position.Copy()
+
+	// Pass position history for repetition detection
+	g.engine.SetPositionHistory(g.positionHashes)
 
 	go func() {
 		move := g.engine.Search(pos)
@@ -438,6 +472,7 @@ func (g *Game) NewGameAction() {
 	g.position = board.NewPosition()
 	g.moveHistory = nil
 	g.sanHistory = nil
+	g.positionHashes = []uint64{g.position.Hash} // Reset with starting position
 	g.lastMove = board.NoMove
 	g.clearSelection()
 	g.gameOver = false

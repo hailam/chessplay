@@ -286,6 +286,97 @@ func Evaluate(pos *board.Position) int {
 	return score
 }
 
+// EvaluateWithPawnTable is like Evaluate but uses cached pawn structure.
+func EvaluateWithPawnTable(pos *board.Position, pawnTable *PawnTable) int {
+	var mgScore, egScore int
+	var phase int
+
+	for c := board.White; c <= board.Black; c++ {
+		sign := 1
+		if c == board.Black {
+			sign = -1
+		}
+
+		for pt := board.Pawn; pt <= board.King; pt++ {
+			bb := pos.Pieces[c][pt]
+			for bb != 0 {
+				sq := bb.PopLSB()
+
+				mgScore += sign * pieceValues[pt]
+				egScore += sign * pieceValues[pt]
+
+				pstSq := sq
+				if c == board.Black {
+					pstSq = sq.Mirror()
+				}
+
+				if pt == board.King {
+					mgScore += sign * kingMidgamePST[pstSq]
+					egScore += sign * kingEndgamePST[pstSq]
+				} else {
+					pstValue := psts[pt][pstSq]
+					mgScore += sign * pstValue
+					egScore += sign * pstValue
+				}
+
+				switch pt {
+				case board.Knight, board.Bishop:
+					phase += 1
+				case board.Rook:
+					phase += 2
+				case board.Queen:
+					phase += 4
+				}
+			}
+		}
+	}
+
+	ppMg, ppEg := evaluatePassedPawns(pos)
+	mgScore += ppMg
+	egScore += ppEg
+
+	mobMg, mobEg := evaluateMobility(pos)
+	mgScore += mobMg
+	egScore += mobEg
+
+	kingSafety := evaluateKingSafety(pos)
+	mgScore += kingSafety
+
+	bpMg, bpEg := evaluateBishopPair(pos)
+	mgScore += bpMg
+	egScore += bpEg
+
+	rfMg, rfEg := evaluateRooksOnFiles(pos)
+	mgScore += rfMg
+	egScore += rfEg
+
+	// Use cached pawn structure evaluation
+	psMg, psEg := evaluatePawnStructureWithCache(pos, pawnTable)
+	mgScore += psMg
+	egScore += psEg
+
+	opMg, opEg := evaluateOutposts(pos)
+	mgScore += opMg
+	egScore += opEg
+
+	thrMg, thrEg := evaluateThreats(pos)
+	mgScore += thrMg
+	egScore += thrEg
+
+	const maxPhase = 24
+	if phase > maxPhase {
+		phase = maxPhase
+	}
+
+	score := (mgScore*phase + egScore*(maxPhase-phase)) / maxPhase
+	score += tempoBonus
+
+	if pos.SideToMove == board.Black {
+		return -score
+	}
+	return score
+}
+
 // EvaluateMaterial returns just the material balance (for quick evaluation).
 func EvaluateMaterial(pos *board.Position) int {
 	score := 0
@@ -915,6 +1006,23 @@ func evaluatePawnStructure(pos *board.Position) (mgPenalty, egPenalty int) {
 		}
 	}
 	return mgPenalty, egPenalty
+}
+
+// evaluatePawnStructureWithCache evaluates pawn structure using the pawn hash table.
+func evaluatePawnStructureWithCache(pos *board.Position, pt *PawnTable) (mgScore, egScore int) {
+	if pt == nil {
+		return evaluatePawnStructure(pos)
+	}
+
+	// Try to get cached evaluation
+	if mg, eg, found := pt.Probe(pos.PawnKey); found {
+		return mg, eg
+	}
+
+	// Compute and cache
+	mg, eg := evaluatePawnStructure(pos)
+	pt.Store(pos.PawnKey, mg, eg)
+	return mg, eg
 }
 
 // evaluateOutposts evaluates knight and bishop outposts.

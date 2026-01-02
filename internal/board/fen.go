@@ -74,6 +74,7 @@ func ParseFEN(fen string) (*Position, error) {
 	pos.updateOccupied()
 	pos.findKings()
 	pos.Hash = pos.ComputeHash()
+	pos.PawnKey = pos.ComputePawnKey()
 
 	return pos, nil
 }
@@ -225,4 +226,20 @@ func (p *Position) ComputeHash() uint64 {
 	}
 
 	return hash
+}
+
+// ComputePawnKey computes the pawn hash key from scratch.
+// Only includes pawn positions for pawn structure caching.
+func (p *Position) ComputePawnKey() uint64 {
+	var key uint64
+
+	for c := White; c <= Black; c++ {
+		bb := p.Pieces[c][Pawn]
+		for bb != 0 {
+			sq := bb.PopLSB()
+			key ^= zobristPiece[c][Pawn][sq]
+		}
+	}
+
+	return key
 }

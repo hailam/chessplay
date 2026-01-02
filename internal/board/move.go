@@ -225,6 +225,7 @@ type UndoInfo struct {
 	EnPassant      Square
 	HalfMoveClock  int
 	Hash           uint64
+	PawnKey        uint64
 	Checkers       Bitboard
 	Valid          bool // True if move was actually applied
 }

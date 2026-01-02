@@ -660,6 +660,7 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 		EnPassant:      p.EnPassant,
 		HalfMoveClock:  p.HalfMoveClock,
 		Hash:           p.Hash,
+		PawnKey:        p.PawnKey,
 		Checkers:       p.Checkers,
 		Valid:          false,
 	}
@@ -704,17 +705,27 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 		}
 		undo.CapturedPiece = p.removePiece(capturedSq)
 		p.Hash ^= zobristPiece[them][Pawn][capturedSq]
+		p.PawnKey ^= zobristPiece[them][Pawn][capturedSq] // Pawn captured
 	} else if captured := p.PieceAt(to); captured != NoPiece {
 		// Normal capture
 		undo.CapturedPiece = captured
 		p.removePiece(to)
 		p.Hash ^= zobristPiece[them][captured.Type()][to]
+		if captured.Type() == Pawn {
+			p.PawnKey ^= zobristPiece[them][Pawn][to] // Pawn captured
+		}
 	}
 
 	// Move the piece
 	p.movePiece(from, to)
 	p.Hash ^= zobristPiece[us][pt][from]
 	p.Hash ^= zobristPiece[us][pt][to]
+
+	// Update pawn key for pawn moves
+	if pt == Pawn {
+		p.PawnKey ^= zobristPiece[us][Pawn][from]
+		p.PawnKey ^= zobristPiece[us][Pawn][to]
+	}
 
 	// Handle promotion
 	if m.IsPromotion() {
@@ -724,6 +735,8 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 		p.Pieces[us][promoPt] |= SquareBB(to)
 		p.Hash ^= zobristPiece[us][Pawn][to]
 		p.Hash ^= zobristPiece[us][promoPt][to]
+		// Pawn is removed from board (promoted), so remove from pawn key
+		p.PawnKey ^= zobristPiece[us][Pawn][to]
 	}
 
 	// Handle castling
@@ -809,6 +822,7 @@ func (p *Position) UnmakeMove(m Move, undo UndoInfo) {
 	p.EnPassant = undo.EnPassant
 	p.HalfMoveClock = undo.HalfMoveClock
 	p.Hash = undo.Hash
+	p.PawnKey = undo.PawnKey
 	p.Checkers = undo.Checkers
 	p.SideToMove = us
 

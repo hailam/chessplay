@@ -37,9 +37,10 @@ type PVTable struct {
 
 // Searcher performs the alpha-beta search.
 type Searcher struct {
-	pos     *board.Position
-	tt      *TranspositionTable
-	orderer *MoveOrderer
+	pos       *board.Position
+	tt        *TranspositionTable
+	pawnTable *PawnTable
+	orderer   *MoveOrderer
 
 	// Search state
 	nodes    uint64
@@ -53,13 +54,21 @@ type Searcher struct {
 
 	// Eval stack for improving heuristic
 	evalStack [MaxPly]int
+
+	// Position history for repetition detection
+	posHistory    []uint64
+	rootPosHashes []uint64 // Position hashes from game history (before search)
+
+	// Multi-PV support: moves to exclude at root
+	excludedRootMoves []board.Move
 }
 
 // NewSearcher creates a new searcher.
 func NewSearcher(tt *TranspositionTable) *Searcher {
 	return &Searcher{
-		tt:      tt,
-		orderer: NewMoveOrderer(),
+		tt:        tt,
+		pawnTable: NewPawnTable(1), // 1MB pawn hash table
+		orderer:   NewMoveOrderer(),
 	}
 }
 
@@ -80,15 +89,33 @@ func (s *Searcher) Nodes() uint64 {
 	return s.nodes
 }
 
+// evaluate returns the static evaluation using cached pawn structure.
+func (s *Searcher) evaluate() int {
+	return EvaluateWithPawnTable(s.pos, s.pawnTable)
+}
+
 // Search performs the search at the given depth.
 func (s *Searcher) Search(pos *board.Position, depth int) (board.Move, int) {
 	return s.SearchWithBounds(pos, depth, -Infinity, Infinity)
+}
+
+// SetRootHistory sets the position history from the game (for repetition detection).
+// This should be called before Search() with hashes from the game's move history.
+func (s *Searcher) SetRootHistory(hashes []uint64) {
+	s.rootPosHashes = make([]uint64, len(hashes))
+	copy(s.rootPosHashes, hashes)
 }
 
 // SearchWithBounds performs search with custom alpha/beta bounds (for aspiration windows).
 func (s *Searcher) SearchWithBounds(pos *board.Position, depth, alpha, beta int) (board.Move, int) {
 	s.pos = pos.Copy()
 	// Note: Reset() is called once by SearchWithLimits, not here per-depth
+
+	// Initialize position history for this search
+	// Start with game history and add current position
+	s.posHistory = make([]uint64, 0, len(s.rootPosHashes)+MaxPly)
+	s.posHistory = append(s.posHistory, s.rootPosHashes...)
+	s.posHistory = append(s.posHistory, s.pos.Hash)
 
 	score := s.negamax(depth, 0, alpha, beta, board.NoMove)
 
@@ -131,7 +158,11 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 	ttEntry, found := s.tt.Probe(s.pos.Hash)
 	if found {
 		ttMove = ttEntry.BestMove
-		if int(ttEntry.Depth) >= depth {
+
+		// Multi-PV: don't use TT cutoffs at root if TT move is excluded
+		ttCutoffAllowed := ply > 0 || !s.isExcludedRootMove(ttMove)
+
+		if int(ttEntry.Depth) >= depth && ttCutoffAllowed {
 			score := AdjustScoreFromTT(int(ttEntry.Score), ply)
 			switch ttEntry.Flag {
 			case TTExact:
@@ -192,7 +223,7 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 	}
 
 	// Static evaluation for pruning decisions
-	staticEval := Evaluate(s.pos)
+	staticEval := s.evaluate()
 
 	// Store eval in stack for improving heuristic
 	s.evalStack[ply] = staticEval
@@ -362,6 +393,11 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 		PickMove(moves, scores, i)
 		move := moves.Get(i)
 
+		// Multi-PV: skip excluded moves at root
+		if ply == 0 && s.isExcludedRootMove(move) {
+			continue
+		}
+
 		isCapture := move.IsCapture(s.pos)
 		isPromotion := move.IsPromotion()
 
@@ -404,6 +440,9 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 		if !s.undoStack[ply].Valid {
 			continue
 		}
+
+		// Track position hash for repetition detection
+		s.posHistory = append(s.posHistory, s.pos.Hash)
 
 		movesSearched++
 		var score int
@@ -450,6 +489,9 @@ func (s *Searcher) negamax(depth, ply int, alpha, beta int, prevMove board.Move)
 				score = -s.negamax(newDepth, ply+1, -beta, -alpha, move)
 			}
 		}
+
+		// Pop position hash before unmake
+		s.posHistory = s.posHistory[:len(s.posHistory)-1]
 
 		// Unmake move
 		s.pos.UnmakeMove(move, s.undoStack[ply])
@@ -542,7 +584,7 @@ func (s *Searcher) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 	// Depth limit to prevent infinite recursion
 	const maxQuiescencePly = 32
 	if ply >= MaxPly || qPly > maxQuiescencePly {
-		return Evaluate(s.pos)
+		return s.evaluate()
 	}
 
 	// Check for stop
@@ -562,7 +604,7 @@ func (s *Searcher) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 	}
 
 	// Stand pat (evaluate current position)
-	standPat := Evaluate(s.pos)
+	standPat := s.evaluate()
 
 	if standPat >= beta {
 		return beta
@@ -682,8 +724,22 @@ func (s *Searcher) isDraw() bool {
 		return true
 	}
 
-	// Note: Repetition detection would require storing position history
-	// For now, we rely on the game-level repetition check
+	// Threefold repetition
+	// Current position hash is the last one in posHistory
+	// Count how many times it appears
+	if len(s.posHistory) > 0 {
+		currentHash := s.pos.Hash
+		count := 0
+		for _, h := range s.posHistory {
+			if h == currentHash {
+				count++
+				if count >= 2 {
+					// Current position + 2 in history = 3 total
+					return true
+				}
+			}
+		}
+	}
 
 	return false
 }
@@ -709,8 +765,14 @@ func (s *Searcher) singularSearch(depth, ply int, alpha, beta int, prevMove, exc
 			continue
 		}
 
+		// Track position hash for repetition detection
+		s.posHistory = append(s.posHistory, s.pos.Hash)
+
 		// Search with null window
 		score := -s.negamax(depth-1, ply+1, -beta, -alpha, move)
+
+		// Pop position hash before unmake
+		s.posHistory = s.posHistory[:len(s.posHistory)-1]
 
 		s.pos.UnmakeMove(move, s.undoStack[ply])
 
@@ -746,4 +808,14 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+// isExcludedRootMove checks if a move is in the excluded list (for Multi-PV).
+func (s *Searcher) isExcludedRootMove(move board.Move) bool {
+	for _, excluded := range s.excludedRootMoves {
+		if move == excluded {
+			return true
+		}
+	}
+	return false
 }
