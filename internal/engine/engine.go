@@ -492,6 +492,9 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 		startDepth = 2
 	}
 
+	// Track recent scores for volatility calculation
+	recentScores := make([]int, 0, 10)
+
 	for depth := startDepth; depth <= maxDepth; depth++ {
 		if e.stopFlag.Load() {
 			return
@@ -500,12 +503,43 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 		var move board.Move
 		var score int
 
-		// Use aspiration windows after depth 4
-		// Vary window by worker ID for search diversity
+		// Use dynamic aspiration windows after depth 4
+		// Window size adapts based on score volatility
 		if depth >= 5 && prevScore != 0 {
-			window := 50 + (workerID%8)*5 // Workers use slightly different windows
+			// Calculate volatility from recent scores
+			volatility := 0
+			if len(recentScores) >= 2 {
+				minScore, maxScore := recentScores[0], recentScores[0]
+				for _, s := range recentScores {
+					if s < minScore {
+						minScore = s
+					}
+					if s > maxScore {
+						maxScore = s
+					}
+				}
+				volatility = maxScore - minScore
+			}
+
+			// Dynamic window size based on volatility
+			var window int
+			if volatility > 400 {
+				// High volatility (tactical position): use wider window
+				window = 150 + volatility/4
+			} else if volatility < 50 {
+				// Stable position: use tight window
+				window = 25
+			} else {
+				// Normal: moderate window
+				window = 50 + volatility/8
+			}
+
+			// Add worker-specific variation for search diversity
+			window += (workerID % 8) * 3
+
 			alpha := prevScore - window
 			beta := prevScore + window
+			retryCount := 0
 
 			for {
 				move, score = worker.SearchDepth(depth, alpha, beta)
@@ -515,9 +549,21 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 				}
 
 				if score <= alpha {
-					alpha = -Infinity
+					// Failed low: gradually expand alpha
+					retryCount++
+					if retryCount >= 2 {
+						alpha = -Infinity
+					} else {
+						alpha = prevScore - window*2
+					}
 				} else if score >= beta {
-					beta = Infinity
+					// Failed high: gradually expand beta
+					retryCount++
+					if retryCount >= 2 {
+						beta = Infinity
+					} else {
+						beta = prevScore + window*2
+					}
 				} else {
 					break
 				}
@@ -535,6 +581,12 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 		}
 
 		prevScore = score
+
+		// Track score for volatility calculation
+		recentScores = append(recentScores, score)
+		if len(recentScores) > 10 {
+			recentScores = recentScores[1:] // Keep last 10 scores
+		}
 
 		// Send result
 		pv := worker.GetPV()

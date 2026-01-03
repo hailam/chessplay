@@ -22,6 +22,26 @@ func init() {
 	}
 }
 
+// SearchStack stores per-ply search state for continuation history tracking.
+// Ported from Stockfish's Stack structure.
+type SearchStack struct {
+	// Current move at this ply
+	currentMove board.Move
+
+	// Piece that moved at this ply
+	movedPiece board.Piece
+
+	// Destination square of the move
+	moveTo board.Square
+
+	// Pointer to continuation history table for this move's piece/to
+	// Used by child nodes to look up move patterns
+	continuationHistory *PieceToHistory
+
+	// Statistical score for history-based decisions
+	statScore int
+}
+
 // Worker represents a search worker for parallel Lazy SMP search.
 // Each worker has its own state but shares the transposition table and history.
 type Worker struct {
@@ -38,8 +58,9 @@ type Worker struct {
 	pv    PVTable
 
 	// Per-worker stacks
-	undoStack [MaxPly]board.UndoInfo
-	evalStack [MaxPly]int
+	undoStack   [MaxPly]board.UndoInfo
+	evalStack   [MaxPly]int
+	searchStack [MaxPly]SearchStack // For continuation history tracking
 
 	// Per-worker position history for repetition detection
 	posHistory    []uint64
@@ -373,8 +394,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Razoring
-	if depth <= 2 && !inCheck && ply > 0 {
+	// Razoring (Stockfish: depth <= 3)
+	if depth <= 3 && !inCheck && ply > 0 {
 		razorMargin := 300 + 100*depth
 		if staticEval+razorMargin <= alpha {
 			score := w.quiescence(ply, alpha, beta)
@@ -470,10 +491,10 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Futility Pruning flag
+	// Futility Pruning flag (Stockfish: depth <= 5)
 	pruneQuietMoves := false
-	if depth <= 3 && !inCheck && ply > 0 {
-		futilityMargin := []int{0, 200, 300, 500}
+	if depth <= 5 && !inCheck && ply > 0 {
+		futilityMargin := []int{0, 200, 300, 500, 700, 900}
 		if staticEval+futilityMargin[depth] <= alpha {
 			pruneQuietMoves = true
 		}
@@ -530,9 +551,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			continue
 		}
 
-		// SEE pruning
-		if isCapture && depth <= 3 && !inCheck && movesSearched > 0 {
-			if SEE(w.pos, move) < 0 {
+		// SEE pruning - prune bad captures at low depths (Stockfish: depth <= 7)
+		if isCapture && depth <= 7 && !inCheck && movesSearched > 0 {
+			// Scale threshold based on depth: deeper = more permissive
+			seeThreshold := -20 * depth
+			if SEE(w.pos, move) < seeThreshold {
 				continue
 			}
 		}
@@ -556,12 +579,21 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 
 		// Make move
+		movingPiece := w.pos.PieceAt(move.From())
+		moveTo := move.To()
+
 		w.nnuePush()
 		w.undoStack[ply] = w.pos.MakeMove(move)
 		if !w.undoStack[ply].Valid {
 			w.nnuePop()
 			continue
 		}
+
+		// Store move info in search stack for continuation history
+		w.searchStack[ply].currentMove = move
+		w.searchStack[ply].movedPiece = movingPiece
+		w.searchStack[ply].moveTo = moveTo
+		w.searchStack[ply].continuationHistory = w.orderer.GetContinuationHistoryTable(movingPiece, moveTo)
 
 		w.posHistory = append(w.posHistory, w.pos.Hash)
 		movesSearched++
@@ -594,13 +626,30 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 				reduction -= 2
 			}
 
-			// History-based adjustment (combine local and shared history)
+			// Calculate statScore: combine main history + continuation histories
+			// Ported from Stockfish's statScore calculation
 			from := move.From()
 			to := move.To()
 			localHist := w.orderer.history[from][to]
 			sharedHist := w.sharedHistory.Get(int(from), int(to))
-			histScore := (localHist + sharedHist) / 2 // Average of local and shared
-			reduction -= histScore / 8192
+			mainHist := (localHist + sharedHist) / 2
+
+			// Add continuation history contributions from 1-ply and 2-ply back
+			contHist0 := 0
+			contHist1 := 0
+			if ply >= 1 && w.searchStack[ply-1].continuationHistory != nil {
+				contHist0 = w.searchStack[ply-1].continuationHistory[movingPiece][moveTo]
+			}
+			if ply >= 2 && w.searchStack[ply-2].continuationHistory != nil {
+				contHist1 = w.searchStack[ply-2].continuationHistory[movingPiece][moveTo]
+			}
+
+			// Combine: 2*mainHist + contHist[0] + contHist[1] (Stockfish formula)
+			statScore := 2*mainHist + contHist0 + contHist1
+			w.searchStack[ply].statScore = statScore
+
+			// Apply statScore to reduction (Stockfish: r -= statScore * 850 / 8192)
+			reduction -= statScore * 850 / 8192
 
 			// Ensure reduction is reasonable
 			if reduction < 1 {
@@ -686,6 +735,10 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 					movePiece := w.pos.PieceAt(move.To())
 					w.orderer.UpdateCountermoveHistory(prevMove, move, prevPiece, movePiece, depth, true)
 				}
+
+				// Update continuation history for multiple plies back (Stockfish style)
+				// This learns move pair patterns at different ply distances
+				w.updateContinuationHistories(ply, movingPiece, moveTo, depth, true)
 			}
 
 			return score
@@ -938,4 +991,33 @@ func (w *Worker) detectSeriousThreats() bool {
 	}
 
 	return false
+}
+
+// updateContinuationHistories updates continuation history for multiple plies back.
+// Ported from Stockfish's update_continuation_histories function.
+// Updates plies 1, 2, 3, 4, 5, 6 with weighted bonuses.
+func (w *Worker) updateContinuationHistories(ply int, piece board.Piece, toSq board.Square, depth int, isGood bool) {
+	// Update continuation history for plies 1-6 back
+	for plyBack := 1; plyBack <= 6; plyBack++ {
+		targetPly := ply - plyBack
+		if targetPly < 0 {
+			break
+		}
+
+		ss := &w.searchStack[targetPly]
+		if ss.currentMove == board.NoMove || ss.movedPiece == board.NoPiece {
+			continue
+		}
+
+		// Update the continuation history entry
+		w.orderer.UpdateContinuationHistory(
+			ss.movedPiece,
+			ss.moveTo,
+			piece,
+			toSq,
+			depth,
+			plyBack,
+			isGood,
+		)
+	}
 }

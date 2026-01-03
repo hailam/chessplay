@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/hailam/chessplay/internal/board"
@@ -16,14 +15,10 @@ const (
 	TTUpperBound               // Failed low
 )
 
-// Number of shards for TT locking (power of 2 for fast modulo)
-// 1024 shards reduces lock contention on high-core systems
-const ttShardCount = 1024
-const ttShardMask = ttShardCount - 1
-
 // TTEntry represents an entry in the transposition table.
+// This is the logical view - internally stored as packed atomic values.
 type TTEntry struct {
-	Key      uint64     // Full 64-bit Zobrist hash for verification (eliminates collisions)
+	Key      uint64     // Full 64-bit Zobrist hash for verification
 	BestMove board.Move // Best move found
 	Score    int16      // Score (bounded by flag)
 	Depth    int8       // Search depth
@@ -32,11 +27,47 @@ type TTEntry struct {
 	IsPV     bool       // True if this entry was on the principal variation
 }
 
-// TranspositionTable is a hash table for storing search results.
-// Uses sharded locking for thread-safety in Lazy SMP.
+// TTEntryPacked is the lock-free atomic storage format.
+// Uses XOR verification to detect torn reads/writes.
+type TTEntryPacked struct {
+	// keyData stores: key XOR moveData (for verification)
+	keyData atomic.Uint64
+
+	// moveData packs: move(16) | score(16) | depth(8) | flag(4) | isPV(4) | age(8) | reserved(8)
+	moveData atomic.Uint64
+}
+
+// packMoveData packs entry fields into a single uint64.
+func packMoveData(move board.Move, score int16, depth int8, flag TTFlag, isPV bool, age uint8) uint64 {
+	var data uint64
+	data |= uint64(move) & 0xFFFF                   // bits 0-15: move
+	data |= (uint64(uint16(score)) & 0xFFFF) << 16  // bits 16-31: score
+	data |= (uint64(uint8(depth)) & 0xFF) << 32     // bits 32-39: depth
+	data |= (uint64(flag) & 0xF) << 40              // bits 40-43: flag
+	isPVBit := uint64(0)
+	if isPV {
+		isPVBit = 1
+	}
+	data |= isPVBit << 44                           // bit 44: isPV
+	data |= (uint64(age) & 0xFF) << 48              // bits 48-55: age
+	return data
+}
+
+// unpackMoveData unpacks a uint64 into entry fields.
+func unpackMoveData(data uint64) (move board.Move, score int16, depth int8, flag TTFlag, isPV bool, age uint8) {
+	move = board.Move(data & 0xFFFF)
+	score = int16((data >> 16) & 0xFFFF)
+	depth = int8((data >> 32) & 0xFF)
+	flag = TTFlag((data >> 40) & 0xF)
+	isPV = ((data >> 44) & 0x1) != 0
+	age = uint8((data >> 48) & 0xFF)
+	return
+}
+
+// TranspositionTable is a lock-free hash table for storing search results.
+// Uses atomic operations with XOR verification for thread-safety.
 type TranspositionTable struct {
-	entries []TTEntry
-	shards  [ttShardCount]sync.RWMutex // Sharded locks
+	entries []TTEntryPacked
 	size    uint64
 	mask    uint64
 	age     atomic.Uint32
@@ -49,14 +80,14 @@ type TranspositionTable struct {
 // NewTranspositionTable creates a transposition table with the given size in MB.
 func NewTranspositionTable(sizeMB int) *TranspositionTable {
 	// Calculate number of entries
-	entrySize := uint64(16) // Size of TTEntry with 64-bit key
+	entrySize := uint64(16) // Two uint64 values
 	numEntries := (uint64(sizeMB) * 1024 * 1024) / entrySize
 
 	// Round down to power of 2 for fast modulo
 	numEntries = roundDownToPowerOf2(numEntries)
 
 	return &TranspositionTable{
-		entries: make([]TTEntry, numEntries),
+		entries: make([]TTEntryPacked, numEntries),
 		size:    numEntries,
 		mask:    numEntries - 1,
 	}
@@ -73,56 +104,79 @@ func roundDownToPowerOf2(n uint64) uint64 {
 	return (n + 1) >> 1
 }
 
-// shardIndex returns the shard index for a given entry index.
-func (tt *TranspositionTable) shardIndex(idx uint64) int {
-	return int(idx & ttShardMask)
-}
-
 // Probe looks up a position in the transposition table.
 // Returns the entry and true if found, otherwise returns empty entry and false.
+// Lock-free: uses atomic loads with XOR verification.
 func (tt *TranspositionTable) Probe(hash uint64) (TTEntry, bool) {
 	tt.probes.Add(1)
 
 	idx := hash & tt.mask
-	shard := tt.shardIndex(idx)
+	entry := &tt.entries[idx]
 
-	tt.shards[shard].RLock()
-	entry := tt.entries[idx]
-	tt.shards[shard].RUnlock()
+	// Atomic load of both values
+	keyData := entry.keyData.Load()
+	moveData := entry.moveData.Load()
 
-	// Verify the full 64-bit key matches (eliminates hash collisions)
-	if entry.Key == hash && entry.Depth > 0 {
-		tt.hits.Add(1)
-		return entry, true
+	// XOR verification: keyData should equal hash XOR moveData
+	// This detects torn reads where only one value was updated
+	if keyData != (hash ^ moveData) {
+		return TTEntry{}, false
 	}
 
-	return TTEntry{}, false
+	// Unpack the data
+	move, score, depth, flag, isPV, age := unpackMoveData(moveData)
+
+	// Verify we have valid data
+	if depth <= 0 {
+		return TTEntry{}, false
+	}
+
+	tt.hits.Add(1)
+	return TTEntry{
+		Key:      hash,
+		BestMove: move,
+		Score:    score,
+		Depth:    depth,
+		Flag:     flag,
+		Age:      age,
+		IsPV:     isPV,
+	}, true
 }
 
 // Store saves a position in the transposition table.
 // isPV indicates if this position was on the principal variation.
+// Lock-free: uses atomic stores with XOR encoding.
 func (tt *TranspositionTable) Store(hash uint64, depth int, score int, flag TTFlag, bestMove board.Move, isPV bool) {
 	idx := hash & tt.mask
-	shard := tt.shardIndex(idx)
-
-	tt.shards[shard].Lock()
 	entry := &tt.entries[idx]
 	currentAge := uint8(tt.age.Load())
 
-	// Quality-based replacement strategy (similar to Stockfish):
-	// Quality = depth*4 + ageBonus + exactBonus + pvBonus
-	// Higher quality entries are preferred
+	// Read existing entry for replacement decision
+	existingKeyData := entry.keyData.Load()
+	existingMoveData := entry.moveData.Load()
+
+	// Recover the stored hash using XOR: storedHash = keyData XOR moveData
+	existingKey := existingKeyData ^ existingMoveData
+
+	// Unpack existing entry data
+	_, _, existingDepth, existingFlag, existingIsPV, existingAge := unpackMoveData(existingMoveData)
+
+	// Check if existing entry is valid (has non-zero depth)
+	existingValid := existingDepth > 0
 
 	// Calculate existing entry quality
-	existingQuality := int(entry.Depth) * 4
-	if entry.Age == currentAge {
-		existingQuality += 256 // Current age bonus
-	}
-	if entry.Flag == TTExact {
-		existingQuality += 2 // Exact score bonus
-	}
-	if entry.IsPV {
-		existingQuality += 4 // PV bonus
+	var existingQuality int
+	if existingValid {
+		existingQuality = int(existingDepth) * 4
+		if existingAge == currentAge {
+			existingQuality += 256 // Current age bonus
+		}
+		if existingFlag == TTExact {
+			existingQuality += 2 // Exact score bonus
+		}
+		if existingIsPV {
+			existingQuality += 4 // PV bonus
+		}
 	}
 
 	// Calculate new entry quality
@@ -135,18 +189,20 @@ func (tt *TranspositionTable) Store(hash uint64, depth int, score int, flag TTFl
 		newQuality += 4
 	}
 
-	// Replace if new entry has higher or equal quality,
-	// or if the keys match (update same position)
-	if newQuality >= existingQuality || entry.Key == hash {
-		entry.Key = hash
-		entry.BestMove = bestMove
-		entry.Score = int16(score)
-		entry.Depth = int8(depth)
-		entry.Flag = flag
-		entry.Age = currentAge
-		entry.IsPV = isPV
+	// Replace if:
+	// 1. Same position (update with new info), OR
+	// 2. New entry has higher or equal quality, OR
+	// 3. Existing entry is invalid/empty
+	if existingKey == hash || newQuality >= existingQuality || !existingValid {
+		// Pack and store atomically
+		newMoveData := packMoveData(bestMove, int16(score), int8(depth), flag, isPV, currentAge)
+		newKeyData := hash ^ newMoveData
+
+		// Store in order: moveData first, then keyData
+		// This ensures that a reader seeing the new keyData will also see valid moveData
+		entry.moveData.Store(newMoveData)
+		entry.keyData.Store(newKeyData)
 	}
-	tt.shards[shard].Unlock()
 }
 
 // NewSearch increments the age counter for a new search.
@@ -158,7 +214,8 @@ func (tt *TranspositionTable) NewSearch() {
 // Clear clears the transposition table.
 func (tt *TranspositionTable) Clear() {
 	for i := range tt.entries {
-		tt.entries[i] = TTEntry{}
+		tt.entries[i].keyData.Store(0)
+		tt.entries[i].moveData.Store(0)
 	}
 	tt.age.Store(0)
 	tt.hits.Store(0)
@@ -176,7 +233,9 @@ func (tt *TranspositionTable) HashFull() int {
 
 	currentAge := uint8(tt.age.Load())
 	for i := 0; i < sampleSize; i++ {
-		if tt.entries[i].Depth > 0 && tt.entries[i].Age == currentAge {
+		moveData := tt.entries[i].moveData.Load()
+		_, _, depth, _, _, age := unpackMoveData(moveData)
+		if depth > 0 && age == currentAge {
 			used++
 		}
 	}

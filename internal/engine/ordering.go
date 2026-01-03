@@ -76,6 +76,20 @@ var mvvLva = [6][6]int{
 // MaxLowPly is the maximum ply for low-ply history tracking
 const MaxLowPly = 5
 
+// PieceToHistory is a history table indexed by [piece][toSquare].
+// Used for continuation history (tracks piece-destination patterns).
+// Like Stockfish's PieceToHistory but simplified for Go.
+type PieceToHistory [12][64]int
+
+// ContinuationHistory stores PieceToHistory tables indexed by the previous move's
+// [piece][toSquare]. This allows tracking move pair patterns across plies.
+// Ported from Stockfish's ContinuationHistory structure.
+type ContinuationHistory [12][64]PieceToHistory
+
+// Continuation history bonus weights per ply (from Stockfish)
+// Ply 1: 1133, Ply 2: 683, Ply 3: 312, Ply 4: 582, Ply 5: 149, Ply 6: 474
+var contHistBonusWeights = [6]int{1133, 683, 312, 582, 149, 474}
+
 // MoveOrderer handles move ordering for the search.
 type MoveOrderer struct {
 	// Killer moves (quiet moves that caused beta cutoffs)
@@ -96,6 +110,11 @@ type MoveOrderer struct {
 
 	// Countermove history (indexed by [prevPiece][prevTo][movePiece][moveTo])
 	countermoveHistory [12][64][12][64]int
+
+	// Continuation history - tracks move pair patterns across plies
+	// Indexed by [prevPiece][prevTo] -> PieceToHistory table
+	// Used in LMR and move scoring for deeper pattern recognition
+	continuationHistory ContinuationHistory
 }
 
 // NewMoveOrderer creates a new move orderer.
@@ -149,6 +168,17 @@ func (mo *MoveOrderer) Clear() {
 			for k := range mo.countermoveHistory[i][j] {
 				for l := range mo.countermoveHistory[i][j][k] {
 					mo.countermoveHistory[i][j][k][l] /= 2
+				}
+			}
+		}
+	}
+
+	// Age continuation history
+	for i := range mo.continuationHistory {
+		for j := range mo.continuationHistory[i] {
+			for k := range mo.continuationHistory[i][j] {
+				for l := range mo.continuationHistory[i][j][k] {
+					mo.continuationHistory[i][j][k][l] /= 2
 				}
 			}
 		}
@@ -496,4 +526,59 @@ func (mo *MoveOrderer) GetCountermoveHistoryScore(prevMove board.Move, prevPiece
 		return 0
 	}
 	return mo.countermoveHistory[prevPiece][prevMove.To()][movePiece][moveTo]
+}
+
+// GetContinuationHistoryTable returns a pointer to the PieceToHistory table
+// for the given piece and destination square. Used in search stack.
+func (mo *MoveOrderer) GetContinuationHistoryTable(piece board.Piece, toSq board.Square) *PieceToHistory {
+	if piece == board.NoPiece {
+		return nil
+	}
+	return &mo.continuationHistory[piece][toSq]
+}
+
+// GetContinuationHistoryScore returns the continuation history score for a move
+// given the previous move's piece and to-square.
+func (mo *MoveOrderer) GetContinuationHistoryScore(prevPiece board.Piece, prevTo board.Square, movePiece board.Piece, moveTo board.Square) int {
+	if prevPiece == board.NoPiece || movePiece == board.NoPiece {
+		return 0
+	}
+	return mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo]
+}
+
+// UpdateContinuationHistory updates the continuation history for a move pair.
+// Called when a quiet move causes a beta cutoff.
+// plyBack indicates how many plies back (1 = parent, 2 = grandparent, etc.)
+func (mo *MoveOrderer) UpdateContinuationHistory(prevPiece board.Piece, prevTo board.Square, movePiece board.Piece, moveTo board.Square, depth, plyBack int, isGood bool) {
+	if prevPiece == board.NoPiece || movePiece == board.NoPiece || plyBack < 1 || plyBack > 6 {
+		return
+	}
+
+	// Use weighted bonus based on ply distance (Stockfish weights)
+	weight := contHistBonusWeights[plyBack-1]
+	bonus := (depth * depth * weight) / 1024
+
+	if isGood {
+		mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo] += bonus
+		if mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo] > 400000 {
+			mo.scaleContinuationHistory()
+		}
+	} else {
+		mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo] -= bonus
+		if mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo] < -400000 {
+			mo.continuationHistory[prevPiece][prevTo][movePiece][moveTo] = -400000
+		}
+	}
+}
+
+func (mo *MoveOrderer) scaleContinuationHistory() {
+	for i := range mo.continuationHistory {
+		for j := range mo.continuationHistory[i] {
+			for k := range mo.continuationHistory[i][j] {
+				for l := range mo.continuationHistory[i][j][k] {
+					mo.continuationHistory[i][j][k][l] /= 2
+				}
+			}
+		}
+	}
 }

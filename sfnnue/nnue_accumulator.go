@@ -380,3 +380,232 @@ func trailingZeros64(x uint64) int {
 	}
 	return n
 }
+
+// ============================================================================
+// Unified Dual Accumulator System
+// Ported from Stockfish's approach of managing big/small networks together
+// ============================================================================
+
+// MaxDirtyPieces is the maximum number of dirty pieces per move
+const MaxDirtyPieces = 3
+
+// DirtyPiece tracks a piece change for incremental accumulator updates
+type DirtyPiece struct {
+	Piece    int // Piece type (0-11 for PNBRQK x2 colors)
+	FromSq   int // Source square (-1 if placed)
+	ToSq     int // Destination square (-1 if removed)
+}
+
+// AccumulatorDelta tracks changes between positions for both networks
+type AccumulatorDelta struct {
+	// Dirty pieces for this move
+	DirtyPieces [MaxDirtyPieces]DirtyPiece
+	DirtyCount  int
+
+	// King squares after the move [perspective]
+	KingSq [2]int
+
+	// Whether king moved for each perspective
+	KingMoved [2]bool
+}
+
+// DualAccumulator holds both big and small network accumulators in unified state.
+// This allows shared feature change computation and coordinated updates.
+type DualAccumulator struct {
+	// Big network accumulator state
+	Big Accumulator
+
+	// Small network accumulator state
+	Small Accumulator
+
+	// Shared delta from previous position (computed once, applied to both)
+	Delta AccumulatorDelta
+
+	// Whether delta has been computed for current position
+	DeltaComputed bool
+}
+
+// NewDualAccumulator creates a new dual accumulator
+func NewDualAccumulator() *DualAccumulator {
+	return &DualAccumulator{
+		Big:   *NewAccumulator(TransformedFeatureDimensionsBig),
+		Small: *NewAccumulator(TransformedFeatureDimensionsSmall),
+	}
+}
+
+// Reset marks both accumulators as not computed
+func (da *DualAccumulator) Reset() {
+	da.Big.Reset()
+	da.Small.Reset()
+	da.DeltaComputed = false
+	da.Delta.DirtyCount = 0
+}
+
+// Copy copies from another dual accumulator (SIMD accelerated)
+func (da *DualAccumulator) Copy(other *DualAccumulator) {
+	da.Big.Copy(&other.Big)
+	da.Small.Copy(&other.Small)
+	da.Delta = other.Delta
+	da.DeltaComputed = other.DeltaComputed
+}
+
+// SetDelta sets the delta for this accumulator position
+func (da *DualAccumulator) SetDelta(delta AccumulatorDelta) {
+	da.Delta = delta
+	da.DeltaComputed = true
+}
+
+// ClearDirtyPieces resets the dirty piece tracking
+func (da *DualAccumulator) ClearDirtyPieces() {
+	da.Delta.DirtyCount = 0
+}
+
+// AddDirtyPiece records a piece change
+func (da *DualAccumulator) AddDirtyPiece(piece, fromSq, toSq int) {
+	if da.Delta.DirtyCount < MaxDirtyPieces {
+		da.Delta.DirtyPieces[da.Delta.DirtyCount] = DirtyPiece{
+			Piece:  piece,
+			FromSq: fromSq,
+			ToSq:   toSq,
+		}
+		da.Delta.DirtyCount++
+	}
+}
+
+// SetKingMoved marks that king moved for the given perspective
+func (da *DualAccumulator) SetKingMoved(perspective int, newKingSq int) {
+	da.Delta.KingMoved[perspective] = true
+	da.Delta.KingSq[perspective] = newKingSq
+	da.Big.NeedsRefresh[perspective] = true
+	da.Small.NeedsRefresh[perspective] = true
+}
+
+// DualAccumulatorStack manages dual accumulators during search.
+// This is a unified stack that keeps big/small in sync.
+type DualAccumulatorStack struct {
+	// Stack of dual accumulators
+	Accumulators []DualAccumulator
+
+	// Current stack size
+	Size int
+}
+
+// NewDualAccumulatorStack creates a new dual accumulator stack
+func NewDualAccumulatorStack() *DualAccumulatorStack {
+	stack := &DualAccumulatorStack{
+		Accumulators: make([]DualAccumulator, MaxStackSize),
+		Size:         1,
+	}
+
+	// Initialize all accumulators
+	for i := range stack.Accumulators {
+		stack.Accumulators[i] = *NewDualAccumulator()
+	}
+
+	return stack
+}
+
+// Reset resets the stack to initial state
+func (s *DualAccumulatorStack) Reset() {
+	s.Size = 1
+	s.Accumulators[0].Reset()
+}
+
+// Push saves current state and prepares for a new position
+func (s *DualAccumulatorStack) Push() {
+	if s.Size < MaxStackSize {
+		// Copy current dual accumulator to next level
+		s.Accumulators[s.Size].Copy(&s.Accumulators[s.Size-1])
+		s.Size++
+	}
+}
+
+// Pop restores previous state
+func (s *DualAccumulatorStack) Pop() {
+	if s.Size > 1 {
+		s.Size--
+	}
+}
+
+// Current returns the current dual accumulator
+func (s *DualAccumulatorStack) Current() *DualAccumulator {
+	return &s.Accumulators[s.Size-1]
+}
+
+// Previous returns the previous dual accumulator (for incremental updates)
+func (s *DualAccumulatorStack) Previous() *DualAccumulator {
+	if s.Size > 1 {
+		return &s.Accumulators[s.Size-2]
+	}
+	return nil
+}
+
+// CurrentBig returns the current big network accumulator (compatibility)
+func (s *DualAccumulatorStack) CurrentBig() *Accumulator {
+	return &s.Accumulators[s.Size-1].Big
+}
+
+// CurrentSmall returns the current small network accumulator (compatibility)
+func (s *DualAccumulatorStack) CurrentSmall() *Accumulator {
+	return &s.Accumulators[s.Size-1].Small
+}
+
+// PreviousBig returns the previous big network accumulator (compatibility)
+func (s *DualAccumulatorStack) PreviousBig() *Accumulator {
+	if s.Size > 1 {
+		return &s.Accumulators[s.Size-2].Big
+	}
+	return nil
+}
+
+// PreviousSmall returns the previous small network accumulator (compatibility)
+func (s *DualAccumulatorStack) PreviousSmall() *Accumulator {
+	if s.Size > 1 {
+		return &s.Accumulators[s.Size-2].Small
+	}
+	return nil
+}
+
+// CanIncrementallyUpdate checks if we can do an incremental update for the given perspective
+func (s *DualAccumulatorStack) CanIncrementallyUpdate(perspective int) bool {
+	if s.Size <= 1 {
+		return false
+	}
+	prev := s.Previous()
+	if prev == nil {
+		return false
+	}
+	curr := s.Current()
+	// Can incrementally update if previous was computed and no king move for this perspective
+	return prev.Big.Computed[perspective] && !curr.Big.NeedsRefresh[perspective]
+}
+
+// GetDirtyPieces returns the dirty pieces for incremental update
+func (s *DualAccumulatorStack) GetDirtyPieces() ([]DirtyPiece, int) {
+	curr := s.Current()
+	return curr.Delta.DirtyPieces[:curr.Delta.DirtyCount], curr.Delta.DirtyCount
+}
+
+// DualAccumulatorCache provides per-king-square caches for both networks.
+// Shares the king-square tracking between big and small networks.
+type DualAccumulatorCache struct {
+	// Big network cache
+	Big *AccumulatorCache
+
+	// Small network cache
+	Small *AccumulatorCache
+}
+
+// NewDualAccumulatorCache creates caches for both networks
+func NewDualAccumulatorCache(bigBiases, smallBiases []int16) *DualAccumulatorCache {
+	return &DualAccumulatorCache{
+		Big:   NewAccumulatorCache(TransformedFeatureDimensionsBig, bigBiases),
+		Small: NewAccumulatorCache(TransformedFeatureDimensionsSmall, smallBiases),
+	}
+}
+
+// Clear resets both caches
+func (dc *DualAccumulatorCache) Clear(bigBiases, smallBiases []int16) {
+	dc.Big.Clear(bigBiases)
+	dc.Small.Clear(smallBiases)
+}

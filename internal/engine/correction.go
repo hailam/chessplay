@@ -4,14 +4,18 @@ import (
 	"github.com/hailam/chessplay/internal/board"
 )
 
+// CorrectionHistorySize is the number of entries (256k = 4x reduction in collisions)
+const CorrectionHistorySize = 262144 // 2^18
+const CorrectionHistoryMask = CorrectionHistorySize - 1
+
 // CorrectionHistory adjusts static evaluation based on search results.
 // When the search discovers the static eval was wrong, we record the error
 // and apply corrections to similar positions in the future.
 // Based on Stockfish's correction history.
 type CorrectionHistory struct {
 	// Position-based correction indexed by hash
-	// Uses 16-bit entries to save memory
-	positionCorr [65536]int16
+	// Uses 16-bit entries to save memory (512KB total)
+	positionCorr [CorrectionHistorySize]int16
 }
 
 // NewCorrectionHistory creates a new correction history table.
@@ -19,10 +23,17 @@ func NewCorrectionHistory() *CorrectionHistory {
 	return &CorrectionHistory{}
 }
 
+// hashIndex computes a better distributed hash index.
+// XORs high bits with low bits for better distribution.
+func (ch *CorrectionHistory) hashIndex(hash uint64) int {
+	// Mix high and low bits for better distribution
+	return int((hash ^ (hash >> 18)) & CorrectionHistoryMask)
+}
+
 // Get returns the correction value for a position.
 // The correction should be added to the static evaluation.
 func (ch *CorrectionHistory) Get(pos *board.Position) int {
-	idx := pos.Hash & 0xFFFF
+	idx := ch.hashIndex(pos.Hash)
 	return int(ch.positionCorr[idx])
 }
 
@@ -48,7 +59,7 @@ func (ch *CorrectionHistory) Update(pos *board.Position, searchScore, staticEval
 		bonus = -256
 	}
 
-	idx := pos.Hash & 0xFFFF
+	idx := ch.hashIndex(pos.Hash)
 	old := int(ch.positionCorr[idx])
 
 	// Gravity update: gradually move toward the target

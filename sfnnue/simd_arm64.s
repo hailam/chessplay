@@ -363,3 +363,190 @@ loop_prefetch:
 	BNE  loop_prefetch
 done_prefetch:
 	RET
+
+// ============================================================================
+// DOT PRODUCT (int8 weights * uint8 inputs)
+// ============================================================================
+// NEON int8/uint8 operations reference:
+// sshll  v2.8h, v0.8b, #0   = 0x0F08A402 (sign-extend low 8 int8 to int16)
+// sshll2 v3.8h, v0.16b, #0  = 0x4F08A403 (sign-extend high 8 int8 to int16)
+// ushll  v4.8h, v1.8b, #0   = 0x2F08A424 (zero-extend low 8 uint8 to uint16)
+// ushll2 v5.8h, v1.16b, #0  = 0x6F08A425 (zero-extend high 8 uint8 to uint16)
+// smull  v6.4s, v2.4h, v4.4h = 0x0E64C046 (signed multiply to 32-bit)
+// smull2 v7.4s, v2.8h, v4.8h = 0x4E64C047 (signed multiply high to 32-bit)
+// addv   s0, v16.4s          = 0x4EB1BA00 (horizontal add)
+
+// func neonDotProductInt8Uint8(weights, inputs unsafe.Pointer, count int) int32
+// Computes: sum(weights[i] * inputs[i]) for i in [0, count)
+// weights: int8 slice, inputs: uint8 slice
+// Returns: int32 sum
+TEXT ·neonDotProductInt8Uint8(SB), NOSPLIT, $0-28
+	MOVD  weights+0(FP), R0     // weights pointer (int8)
+	MOVD  inputs+8(FP), R1      // inputs pointer (uint8)
+	MOVD  count+16(FP), R2      // count
+	MOVW  $0, R3                // Initialize scalar accumulator to zero
+
+	// Check if we have at least 16 elements for SIMD
+	CMP   $16, R2
+	BLT   dot_scalar_only
+
+	// Initialize vector accumulators to zero using EOR
+	WORD  $0x6E301E10           // eor v16.16b, v16.16b, v16.16b
+	WORD  $0x6E311E31           // eor v17.16b, v17.16b, v17.16b
+
+	// Main loop: process 16 elements at a time
+dot_loop16:
+	CMP   $16, R2
+	BLT   dot_finish_simd
+
+	// Load 16 int8 weights: ld1 {v0.16b}, [x0]
+	WORD  $0x4C407000           // ld1 {v0.16b}, [x0]
+	// Load 16 uint8 inputs: ld1 {v1.16b}, [x1]
+	WORD  $0x4C407021           // ld1 {v1.16b}, [x1]
+
+	// Sign-extend low 8 int8 to int16: sshll v2.8h, v0.8b, #0
+	WORD  $0x0F08A402           // sshll v2.8h, v0.8b, #0
+	// Sign-extend high 8 int8 to int16: sshll2 v3.8h, v0.16b, #0
+	WORD  $0x4F08A403           // sshll2 v3.8h, v0.16b, #0
+
+	// Zero-extend low 8 uint8 to uint16: ushll v4.8h, v1.8b, #0
+	WORD  $0x2F08A424           // ushll v4.8h, v1.8b, #0
+	// Zero-extend high 8 uint8 to uint16: ushll2 v5.8h, v1.16b, #0
+	WORD  $0x6F08A425           // ushll2 v5.8h, v1.16b, #0
+
+	// Multiply low half: smull v6.4s, v2.4h, v4.4h (low 4)
+	WORD  $0x0E64C046           // smull v6.4s, v2.4h, v4.4h
+	// Multiply low half high: smull2 v7.4s, v2.8h, v4.8h (high 4 of low half)
+	WORD  $0x4E64C047           // smull2 v7.4s, v2.8h, v4.8h
+
+	// Accumulate: add v16.4s, v16.4s, v6.4s
+	WORD  $0x4EA68610           // add v16.4s, v16.4s, v6.4s
+	WORD  $0x4EA78631           // add v17.4s, v17.4s, v7.4s
+
+	// Multiply high half: smull v6.4s, v3.4h, v5.4h (low 4 of high half)
+	WORD  $0x0E65C066           // smull v6.4s, v3.4h, v5.4h
+	// Multiply high half high: smull2 v7.4s, v3.8h, v5.8h (high 4 of high half)
+	WORD  $0x4E65C067           // smull2 v7.4s, v3.8h, v5.8h
+
+	// Accumulate
+	WORD  $0x4EA68610           // add v16.4s, v16.4s, v6.4s
+	WORD  $0x4EA78631           // add v17.4s, v17.4s, v7.4s
+
+	ADD   $16, R0               // advance weights pointer
+	ADD   $16, R1               // advance inputs pointer
+	SUB   $16, R2, R2           // count -= 16
+	B     dot_loop16
+
+dot_finish_simd:
+	// Combine vector accumulators: add v16.4s, v16.4s, v17.4s
+	WORD  $0x4EB18610           // add v16.4s, v16.4s, v17.4s
+
+	// Horizontal sum: addv s0, v16.4s
+	WORD  $0x4EB1BA00           // addv s0, v16.4s
+
+	// Move to general register: fmov w3, s0
+	WORD  $0x1E260003           // fmov w3, s0
+
+dot_scalar_only:
+	// Handle remaining elements with scalar loop
+	CBZ   R2, dot_done
+
+dot_scalar_loop:
+	MOVB  (R0), R4              // load weight (int8) - sign extends
+	MOVBU (R1), R5              // load input (uint8) - zero extends
+	MULW  R4, R5, R4            // multiply (32-bit)
+	ADDW  R4, R3, R3            // accumulate (32-bit)
+	ADD   $1, R0
+	ADD   $1, R1
+	SUB   $1, R2, R2
+	CBNZ  R2, dot_scalar_loop
+
+dot_done:
+	MOVW  R3, ret+24(FP)        // return result
+	RET
+
+// ============================================================================
+// CLIPPED RELU (int32 input -> uint8 output with shift and clamp)
+// ============================================================================
+// NEON clamp/shift operations:
+// sqshrun v0.8b, v0.8h, #shift = clamp to [0,255] with shift (for 16-bit)
+// For 32-bit we need: shift, clamp to [0, 127], pack
+
+// func neonClippedReLU(input unsafe.Pointer, output unsafe.Pointer, count, shift int)
+// Applies: output[i] = clamp(input[i] >> shift, 0, 127)
+// Processes 4 elements per SIMD iteration
+TEXT ·neonClippedReLU(SB), NOSPLIT, $0-32
+	MOVD  input+0(FP), R0       // input pointer (int32)
+	MOVD  output+8(FP), R1      // output pointer (uint8)
+	MOVD  count+16(FP), R2      // count
+	MOVD  shift+24(FP), R3      // shift amount
+
+	// Prepare constants
+	MOVW  $0, R5                // zero for clamping
+	MOVW  $127, R6              // max value for clamping
+
+	// Check if we have at least 4 elements
+	CMP   $4, R2
+	BLT   crelu_scalar
+
+	// Create vector constants
+	// dup v30.4s, w5 (zero) - 0x4E050BC0 doesn't work, use eor instead
+	WORD  $0x6E3E1FDE           // eor v30.16b, v30.16b, v30.16b
+	// dup v31.4s, w6 (127)
+	WORD  $0x4E040CDF           // dup v31.4s, w6
+
+	// Negate shift for right shift using signed shift
+	NEG   R3, R4
+	// dup v29.4s, w4 (-shift)
+	WORD  $0x4E040C9D           // dup v29.4s, w4
+
+crelu_loop4:
+	CMP   $4, R2
+	BLT   crelu_scalar
+
+	// Load 4 int32: ld1 {v0.4s}, [x0]
+	WORD  $0x4C407800           // ld1 {v0.4s}, [x0]
+
+	// Arithmetic right shift: sshl v0.4s, v0.4s, v29.4s (negative shift = right shift)
+	WORD  $0x4EBD4400           // sshl v0.4s, v0.4s, v29.4s
+
+	// Clamp to [0, 127]
+	// smax v0.4s, v0.4s, v30.4s (clamp lower to 0)
+	WORD  $0x4EBE6400           // smax v0.4s, v0.4s, v30.4s
+	// smin v0.4s, v0.4s, v31.4s (clamp upper to 127)
+	WORD  $0x4EBF6C00           // smin v0.4s, v0.4s, v31.4s
+
+	// Narrow 4x int32 -> 4x int16: xtn v0.4h, v0.4s
+	WORD  $0x0EA12800           // xtn v0.4h, v0.4s
+	// Narrow 4x int16 -> 4x int8: xtn v0.8b, v0.8h (only lower 4 used)
+	WORD  $0x0E212800           // xtn v0.8b, v0.8h
+
+	// Store 4 bytes: st1 {v0.s}[0], [x1]
+	WORD  $0x0D008021           // st1 {v0.s}[0], [x1]
+
+	ADD   $16, R0               // advance input by 16 bytes (4 x int32)
+	ADD   $4, R1                // advance output by 4 bytes
+	SUB   $4, R2, R2
+	B     crelu_loop4
+
+crelu_scalar:
+	CBZ   R2, crelu_done
+
+crelu_scalar_loop:
+	MOVW  (R0), R4              // load int32
+	ASR   R3, R4, R4            // arithmetic right shift
+
+	// Clamp to [0, 127]
+	CMP   R5, R4
+	CSEL  LT, R5, R4, R4        // if R4 < 0, R4 = 0
+	CMP   R6, R4
+	CSEL  GT, R6, R4, R4        // if R4 > 127, R4 = 127
+
+	MOVB  R4, (R1)              // store uint8
+	ADD   $4, R0
+	ADD   $1, R1
+	SUB   $1, R2, R2
+	CBNZ  R2, crelu_scalar_loop
+
+crelu_done:
+	RET

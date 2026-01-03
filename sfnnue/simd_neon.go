@@ -58,6 +58,12 @@ func prefetchL2(addr unsafe.Pointer)
 //go:noescape
 func prefetchLine(addr unsafe.Pointer, count int)
 
+//go:noescape
+func neonDotProductInt8Uint8(weights, inputs unsafe.Pointer, count int) int32
+
+//go:noescape
+func neonClippedReLU(input, output unsafe.Pointer, count, shift int)
+
 // PrefetchL1 prefetches memory at addr into L1 cache.
 func PrefetchL1(addr unsafe.Pointer) {
 	prefetchL1(addr)
@@ -281,32 +287,30 @@ func SIMDSubInt16Offset(dst []int16, src []int16, offset, count int) {
 	}
 }
 
-// SIMDDotProductInt8Uint8 computes dot product (scalar fallback).
+// SIMDDotProductInt8Uint8 computes dot product using ARM64 NEON.
+// Returns: sum(weights[i] * inputs[i]) for i in [0, count)
 func SIMDDotProductInt8Uint8(weights []int8, inputs []uint8, count int) int32 {
-	var sum int32
-	// Unroll by 4 for better performance
-	i := 0
-	for ; i+4 <= count; i += 4 {
-		sum += int32(weights[i]) * int32(inputs[i])
-		sum += int32(weights[i+1]) * int32(inputs[i+1])
-		sum += int32(weights[i+2]) * int32(inputs[i+2])
-		sum += int32(weights[i+3]) * int32(inputs[i+3])
+	if count == 0 {
+		return 0
 	}
-	for ; i < count; i++ {
-		sum += int32(weights[i]) * int32(inputs[i])
+	if count > len(weights) {
+		count = len(weights)
 	}
-	return sum
+	if count > len(inputs) {
+		count = len(inputs)
+	}
+	return neonDotProductInt8Uint8(unsafe.Pointer(&weights[0]), unsafe.Pointer(&inputs[0]), count)
 }
 
-// SIMDClippedReLU applies ClippedReLU activation (scalar fallback).
+// SIMDClippedReLU applies ClippedReLU activation using ARM64 NEON.
+// Applies: output[i] = clamp(input[i] >> shift, 0, 127)
 func SIMDClippedReLU(input []int32, output []uint8, shift int) {
-	for i := range input {
-		val := input[i] >> shift
-		if val < 0 {
-			val = 0
-		} else if val > 127 {
-			val = 127
-		}
-		output[i] = uint8(val)
+	count := len(input)
+	if count == 0 {
+		return
 	}
+	if count > len(output) {
+		count = len(output)
+	}
+	neonClippedReLU(unsafe.Pointer(&input[0]), unsafe.Pointer(&output[0]), count, shift)
 }

@@ -124,10 +124,34 @@ func (ft *FeatureTransformer) ReadParameters(r io.Reader) error {
 
 // permuteWeights reorders weights for SIMD optimization.
 // Ported from nnue_feature_transformer.h:131-137
+// For NEON (128-bit): reorders 8-element int16 blocks so that
+// consecutive SIMD loads align with pack/unzip instructions.
 func (ft *FeatureTransformer) permuteWeights() {
-	// The permutation depends on SIMD width
-	// For now, we use identity permutation (non-SIMD path)
-	// TODO: Implement proper permutation for AVX2/AVX512
+	// NEON permutation order for 8 int16 values (128-bit)
+	// This aligns with uzp1/uzp2 operations for efficient packing
+	order := []int{0, 2, 1, 3, 4, 6, 5, 7}
+
+	// Permute the main weights
+	ft.permuteInt16Slice(ft.Weights, order)
+
+	// Permute the biases
+	ft.permuteInt16Slice(ft.Biases, order)
+}
+
+// permuteInt16Slice reorders an int16 slice in 8-element chunks according to order.
+func (ft *FeatureTransformer) permuteInt16Slice(data []int16, order []int) {
+	blockSize := len(order)
+	temp := make([]int16, blockSize)
+
+	// Process in blocks of 8
+	for start := 0; start+blockSize <= len(data); start += blockSize {
+		// Copy reordered elements to temp
+		for i, o := range order {
+			temp[i] = data[start+o]
+		}
+		// Copy back
+		copy(data[start:start+blockSize], temp)
+	}
 }
 
 // scaleWeights scales weights by 2 for proper clipping behavior.

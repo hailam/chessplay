@@ -252,9 +252,17 @@ func LoadNetworks(bigFile, smallFile string) (*Networks, error) {
 
 // Evaluator provides a high-level interface for NNUE evaluation.
 type Evaluator struct {
-	Networks  *Networks
-	AccStack  *AccumulatorStack
-	BigCache  *AccumulatorCache
+	Networks *Networks
+
+	// Unified dual accumulator stack (manages both big and small together)
+	DualStack *DualAccumulatorStack
+
+	// Unified dual accumulator cache
+	DualCache *DualAccumulatorCache
+
+	// Legacy compatibility - these point into DualStack
+	AccStack   *AccumulatorStack // Deprecated: use DualStack
+	BigCache   *AccumulatorCache
 	SmallCache *AccumulatorCache
 }
 
@@ -265,31 +273,62 @@ func NewEvaluator(bigFile, smallFile string) (*Evaluator, error) {
 		return nil, err
 	}
 
+	dualCache := NewDualAccumulatorCache(
+		networks.Big.FeatureTransformer.Biases,
+		networks.Small.FeatureTransformer.Biases,
+	)
+
 	return &Evaluator{
 		Networks:   networks,
-		AccStack:   NewAccumulatorStack(),
-		BigCache:   NewAccumulatorCache(TransformedFeatureDimensionsBig, networks.Big.FeatureTransformer.Biases),
-		SmallCache: NewAccumulatorCache(TransformedFeatureDimensionsSmall, networks.Small.FeatureTransformer.Biases),
+		DualStack:  NewDualAccumulatorStack(),
+		DualCache:  dualCache,
+		AccStack:   NewAccumulatorStack(), // Legacy compatibility
+		BigCache:   dualCache.Big,
+		SmallCache: dualCache.Small,
 	}, nil
 }
 
 // Push saves accumulator state before a move
 func (e *Evaluator) Push() {
-	e.AccStack.Push()
+	e.DualStack.Push()
+	e.AccStack.Push() // Legacy
 }
 
 // Pop restores accumulator state after unmaking a move
 func (e *Evaluator) Pop() {
-	e.AccStack.Pop()
+	e.DualStack.Pop()
+	e.AccStack.Pop() // Legacy
 }
 
 // Reset resets the accumulator stack
 func (e *Evaluator) Reset() {
-	e.AccStack.Reset()
+	e.DualStack.Reset()
+	e.AccStack.Reset() // Legacy
 }
 
 // Refresh forces a full recomputation of accumulators
 func (e *Evaluator) Refresh() {
-	e.AccStack.CurrentBig().Reset()
-	e.AccStack.CurrentSmall().Reset()
+	e.DualStack.Current().Reset()
+	e.AccStack.CurrentBig().Reset()   // Legacy
+	e.AccStack.CurrentSmall().Reset() // Legacy
+}
+
+// CurrentDual returns the current dual accumulator
+func (e *Evaluator) CurrentDual() *DualAccumulator {
+	return e.DualStack.Current()
+}
+
+// PreviousDual returns the previous dual accumulator
+func (e *Evaluator) PreviousDual() *DualAccumulator {
+	return e.DualStack.Previous()
+}
+
+// RecordPieceChange records a piece movement for incremental updates
+func (e *Evaluator) RecordPieceChange(piece, fromSq, toSq int) {
+	e.DualStack.Current().AddDirtyPiece(piece, fromSq, toSq)
+}
+
+// RecordKingMove records a king movement (triggers full refresh for that perspective)
+func (e *Evaluator) RecordKingMove(perspective, newKingSq int) {
+	e.DualStack.Current().SetKingMoved(perspective, newKingSq)
 }
