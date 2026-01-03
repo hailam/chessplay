@@ -11,6 +11,7 @@ import (
 
 	"github.com/hailam/chessplay/internal/board"
 	"github.com/hailam/chessplay/internal/engine"
+	"github.com/hailam/chessplay/internal/tablebase"
 )
 
 // UCI implements the Universal Chess Interface protocol.
@@ -24,6 +25,11 @@ type UCI struct {
 	// NNUE configuration
 	nnueBigPath   string
 	nnueSmallPath string
+
+	// Syzygy tablebase configuration
+	syzygyPath       string
+	syzygyProbeDepth int
+	syzygyProber     *tablebase.SyzygyProber
 
 	// Search state
 	searching     bool
@@ -88,6 +94,8 @@ func (u *UCI) handleUCI() {
 	fmt.Println("option name UseNNUE type check default false")
 	fmt.Println("option name EvalFile type string default <empty>")
 	fmt.Println("option name EvalFileSmall type string default <empty>")
+	fmt.Println("option name SyzygyPath type string default <empty>")
+	fmt.Println("option name SyzygyProbeDepth type spin default 1 min 1 max 100")
 	fmt.Println("uciok")
 }
 
@@ -519,6 +527,15 @@ func (u *UCI) handleSetOption(args []string) {
 	case "evalfilesmall":
 		u.nnueSmallPath = value
 		u.tryLoadNNUE()
+	case "syzygypath":
+		u.syzygyPath = value
+		u.initSyzygy()
+	case "syzygyprobedepth":
+		depth, err := strconv.Atoi(value)
+		if err == nil && depth >= 1 {
+			u.syzygyProbeDepth = depth
+			u.engine.SetSyzygyProbeDepth(depth)
+		}
 	}
 }
 
@@ -531,6 +548,24 @@ func (u *UCI) tryLoadNNUE() {
 			fmt.Fprintf(os.Stderr, "info string NNUE networks loaded\n")
 		}
 	}
+}
+
+// initSyzygy initializes Syzygy tablebase probing.
+func (u *UCI) initSyzygy() {
+	if u.syzygyPath == "" {
+		return
+	}
+
+	u.syzygyProber = tablebase.NewSyzygyProber(u.syzygyPath)
+	u.engine.SetTablebase(u.syzygyProber)
+
+	probeDepth := u.syzygyProbeDepth
+	if probeDepth < 1 {
+		probeDepth = 1
+	}
+	u.engine.SetSyzygyProbeDepth(probeDepth)
+
+	fmt.Fprintf(os.Stderr, "info string Syzygy tablebase initialized at %s\n", u.syzygyPath)
 }
 
 // handlePerft runs a perft test.

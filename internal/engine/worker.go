@@ -1,11 +1,11 @@
 package engine
 
 import (
-	"log"
 	"math"
 	"sync/atomic"
 
 	"github.com/hailam/chessplay/internal/board"
+	"github.com/hailam/chessplay/internal/tablebase"
 	"github.com/hailam/chessplay/sfnnue"
 )
 
@@ -81,6 +81,10 @@ type Worker struct {
 	nnueNet  *sfnnue.Networks
 	nnueAcc  *sfnnue.AccumulatorStack
 
+	// Tablebase probing
+	tbProber   tablebase.Prober
+	tbProbeDepth int // Minimum depth to probe TB (default: 1)
+
 	// Communication channel for results
 	resultCh chan<- WorkerResult
 
@@ -117,6 +121,15 @@ func (w *Worker) initNNUE(nets *sfnnue.Networks) {
 	w.nnueAcc = sfnnue.NewAccumulatorStack()
 }
 
+// SetTablebase sets the tablebase prober for this worker.
+func (w *Worker) SetTablebase(prober tablebase.Prober, probeDepth int) {
+	w.tbProber = prober
+	w.tbProbeDepth = probeDepth
+	if w.tbProbeDepth < 1 {
+		w.tbProbeDepth = 1
+	}
+}
+
 // ID returns the worker's ID.
 func (w *Worker) ID() int {
 	return w.id
@@ -151,9 +164,7 @@ func (w *Worker) SetExcludedMoves(moves []board.Move) {
 
 // InitSearch initializes the worker for a new search with a position copy.
 func (w *Worker) InitSearch(pos *board.Position) {
-	log.Printf("[Worker %d] InitSearch received pos.SideToMove=%v", w.id, pos.SideToMove)
 	w.pos = pos.Copy()
-	log.Printf("[Worker %d] After copy w.pos.SideToMove=%v", w.id, w.pos.SideToMove)
 
 	// Reset NNUE accumulator for new search to avoid stale state
 	if w.nnueAcc != nil {
@@ -286,6 +297,48 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 	// Check for draw
 	if ply > 0 && w.isDraw() {
 		return 0
+	}
+
+	// Tablebase probing (only in endgame positions)
+	if ply > 0 && w.tbProber != nil && depth >= w.tbProbeDepth {
+		pieceCount := tablebase.CountPieces(w.pos)
+		if pieceCount <= w.tbProber.MaxPieces() {
+			tbResult := w.tbProber.Probe(w.pos)
+			if tbResult.Found {
+				tbScore := tablebase.WDLToScore(tbResult.WDL, ply)
+
+				// Determine TT flag based on WDL
+				var ttFlag TTFlag
+				switch tbResult.WDL {
+				case tablebase.WDLWin, tablebase.WDLCursedWin:
+					// Winning - this is a lower bound (we might find better)
+					if tbScore >= beta {
+						// Store in TT and return
+						w.tt.Store(w.pos.Hash, MaxPly, AdjustScoreToTT(tbScore, ply), TTLowerBound, board.NoMove, true)
+						return tbScore
+					}
+					ttFlag = TTLowerBound
+					if tbScore > alpha {
+						alpha = tbScore
+					}
+				case tablebase.WDLLoss, tablebase.WDLBlessedLoss:
+					// Losing - this is an upper bound
+					if tbScore <= alpha {
+						w.tt.Store(w.pos.Hash, MaxPly, AdjustScoreToTT(tbScore, ply), TTUpperBound, board.NoMove, true)
+						return tbScore
+					}
+					ttFlag = TTUpperBound
+					if tbScore < beta {
+						beta = tbScore
+					}
+				default:
+					// Draw - exact score
+					w.tt.Store(w.pos.Hash, MaxPly, AdjustScoreToTT(tbScore, ply), TTExact, board.NoMove, true)
+					return tbScore
+				}
+				_ = ttFlag // Used for potential future improvements
+			}
+		}
 	}
 
 	// Probe transposition table

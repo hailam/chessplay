@@ -1,5 +1,6 @@
 chessplay
 .claude/
-./bin
+/bin/
 weights/
 /cpu.pprof
+tmp/

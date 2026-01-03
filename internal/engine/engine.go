@@ -138,14 +138,32 @@ func (e *Engine) HasBook() bool {
 	return e.book != nil
 }
 
-// SetTablebase sets the tablebase prober.
+// SetTablebase sets the tablebase prober for the engine and all workers.
 func (e *Engine) SetTablebase(tb tablebase.Prober) {
 	e.tablebase = tb
+	// Pass tablebase to all workers with default probe depth
+	for _, w := range e.workers {
+		w.SetTablebase(tb, 1)
+	}
+}
+
+// SetSyzygyProbeDepth sets the minimum depth for tablebase probing.
+func (e *Engine) SetSyzygyProbeDepth(depth int) {
+	if depth < 1 {
+		depth = 1
+	}
+	for _, w := range e.workers {
+		w.SetTablebase(e.tablebase, depth)
+	}
 }
 
 // EnableLichessTablebase enables Lichess online tablebase lookups.
 func (e *Engine) EnableLichessTablebase() {
 	e.tablebase = tablebase.NewLichessProber()
+	// Pass to all workers
+	for _, w := range e.workers {
+		w.SetTablebase(e.tablebase, 1)
+	}
 }
 
 // HasTablebase returns true if a tablebase is available.
@@ -177,15 +195,12 @@ func (e *Engine) Search(pos *board.Position) board.Move {
 // SearchWithLimits finds the best move with specific search limits.
 // Uses Lazy SMP with multiple workers searching in parallel.
 func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) board.Move {
-	log.Printf("[Search] Received position with SideToMove=%v", pos.SideToMove)
-
 	// Try opening book first
 	if e.book != nil {
 		if move, ok := e.book.Probe(pos); ok {
 			return move
 		}
 	}
-	log.Printf("[Search] After book probe SideToMove=%v", pos.SideToMove)
 
 	// Try tablebase for endgames
 	if e.tablebase != nil && e.tablebase.Available() {
@@ -197,18 +212,10 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 			}
 		}
 	}
-	log.Printf("[Search] After tablebase probe SideToMove=%v", pos.SideToMove)
 
 	// Reset for new search
 	e.stopFlag.Store(false)
 	e.tt.NewSearch()
-
-	// Log evaluation mode
-	if e.useNNUE && e.nnueNet != nil {
-		log.Printf("[Engine] Starting search with NNUE evaluation")
-	} else {
-		log.Printf("[Engine] Starting search with Classical evaluation")
-	}
 
 	// Reset all workers
 	for _, w := range e.workers {
