@@ -2,3 +2,4 @@ chessplay
 .claude/
 ./bin
 weights/
+/cpu.pprof

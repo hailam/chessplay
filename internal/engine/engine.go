@@ -62,10 +62,11 @@ var DifficultySettings = map[Difficulty]SearchLimits{
 // Engine is the chess AI engine.
 type Engine struct {
 	// Workers for parallel search
-	workers   []*Worker
-	pawnTable *PawnTable
-	tt        *TranspositionTable
-	stopFlag  atomic.Bool
+	workers       []*Worker
+	pawnTable     *PawnTable
+	tt            *TranspositionTable
+	sharedHistory *SharedHistory // Shared history for Lazy SMP
+	stopFlag      atomic.Bool
 
 	// Legacy single-threaded searcher (for Multi-PV compatibility)
 	searcher *Searcher
@@ -88,12 +89,14 @@ type Engine struct {
 // NewEngine creates a new chess engine with the given transposition table size in MB.
 func NewEngine(ttSizeMB int) *Engine {
 	tt := NewTranspositionTable(ttSizeMB)
+	sharedHistory := NewSharedHistory()
 
 	e := &Engine{
-		tt:         tt,
-		pawnTable:  NewPawnTable(1), // Shared pawn table for legacy searcher
-		difficulty: Medium,
-		workers:    make([]*Worker, NumWorkers),
+		tt:            tt,
+		pawnTable:     NewPawnTable(1), // Shared pawn table for legacy searcher
+		sharedHistory: sharedHistory,
+		difficulty:    Medium,
+		workers:       make([]*Worker, NumWorkers),
 	}
 
 	log.Printf("[Engine] Creating %d workers (GOMAXPROCS=%d)", NumWorkers, runtime.GOMAXPROCS(0))
@@ -101,7 +104,7 @@ func NewEngine(ttSizeMB int) *Engine {
 	// Create workers, each with its own pawn table for thread safety
 	for i := 0; i < NumWorkers; i++ {
 		workerPawnTable := NewPawnTable(1) // 1MB per worker
-		e.workers[i] = NewWorker(i, tt, workerPawnTable, &e.stopFlag)
+		e.workers[i] = NewWorker(i, tt, workerPawnTable, sharedHistory, &e.stopFlag)
 	}
 
 	// Create legacy searcher for Multi-PV
@@ -313,7 +316,160 @@ resultLoop:
 	return bestMove
 }
 
+// SearchWithUCILimits finds the best move using UCI time controls.
+// Supports wtime/btime/winc/binc for proper tournament time management.
+func (e *Engine) SearchWithUCILimits(pos *board.Position, limits UCILimits, ply int) board.Move {
+	// Try opening book first
+	if e.book != nil {
+		if move, ok := e.book.Probe(pos); ok {
+			return move
+		}
+	}
+
+	// Try tablebase for endgames
+	if e.tablebase != nil && e.tablebase.Available() {
+		pieceCount := tablebase.CountPieces(pos)
+		if pieceCount <= e.tablebase.MaxPieces() {
+			result := e.tablebase.ProbeRoot(pos)
+			if result.Found && result.Move != board.NoMove {
+				return result.Move
+			}
+		}
+	}
+
+	// Initialize time manager
+	tm := NewTimeManager()
+	tm.Init(limits, pos.SideToMove, ply)
+
+	// Reset for new search
+	e.stopFlag.Store(false)
+	e.tt.NewSearch()
+
+	// Reset all workers
+	for _, w := range e.workers {
+		w.Reset()
+	}
+
+	startTime := time.Now()
+	var bestMove board.Move
+	var bestScore int
+	var bestPV []board.Move
+	var bestDepth int
+	var lastBestMove board.Move
+	var stabilityCount int
+	var instabilityCount int
+
+	// Determine maximum depth
+	maxDepth := MaxPly
+	if limits.Depth > 0 {
+		maxDepth = limits.Depth
+	}
+
+	// Create result channel
+	resultCh := make(chan WorkerResult, NumWorkers*maxDepth)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < NumWorkers; i++ {
+		wg.Add(1)
+		go e.workerSearch(i, pos, maxDepth, resultCh, &wg)
+	}
+
+	// Collect results in a separate goroutine
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(resultCh)
+		close(done)
+	}()
+
+	// Process results
+resultLoop:
+	for {
+		select {
+		case result, ok := <-resultCh:
+			if !ok {
+				break resultLoop
+			}
+
+			// Update best result if this is deeper or same depth with better score
+			if result.Move != board.NoMove {
+				if result.Depth > bestDepth ||
+					(result.Depth == bestDepth && result.Score > bestScore) {
+
+					// Track move stability
+					if result.Depth > bestDepth {
+						if result.Move == lastBestMove {
+							stabilityCount++
+							instabilityCount = 0
+						} else {
+							instabilityCount++
+							stabilityCount = 0
+						}
+						lastBestMove = result.Move
+					}
+
+					bestMove = result.Move
+					bestScore = result.Score
+					bestPV = result.PV
+					bestDepth = result.Depth
+
+					// Report info
+					if e.OnInfo != nil {
+						elapsed := time.Since(startTime)
+						e.OnInfo(SearchInfo{
+							Depth:    bestDepth,
+							Score:    bestScore,
+							Nodes:    e.getTotalNodes(),
+							Time:     elapsed,
+							PV:       bestPV,
+							HashFull: e.tt.HashFull(),
+						})
+					}
+
+					// Early termination: found mate
+					if bestScore > MateScore-100 || bestScore < -MateScore+100 {
+						e.stopFlag.Store(true)
+						break resultLoop
+					}
+
+					// Time management: check if we should stop based on stability
+					if tm.PastOptimum() {
+						if stabilityCount >= 4 {
+							// Move is very stable, stop early
+							e.stopFlag.Store(true)
+							break resultLoop
+						}
+					}
+				}
+			}
+
+			// Check time limit
+			if tm.ShouldStop() {
+				e.stopFlag.Store(true)
+				break resultLoop
+			}
+
+			// Node limit check
+			if limits.Nodes > 0 && e.getTotalNodes() >= limits.Nodes {
+				e.stopFlag.Store(true)
+				break resultLoop
+			}
+
+		case <-done:
+			break resultLoop
+		}
+	}
+
+	// Ensure all workers are stopped
+	e.stopFlag.Store(true)
+	<-done
+
+	return bestMove
+}
+
 // workerSearch runs iterative deepening search in a worker goroutine.
+// Uses depth staggering: workers start at different depths to reduce redundant shallow work.
 func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, resultCh chan<- WorkerResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -322,7 +478,21 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 
 	var prevScore int
 
-	for depth := 1; depth <= maxDepth; depth++ {
+	// Depth staggering: helper workers skip shallow depths
+	// Worker 0 (main): starts at depth 1
+	// Workers 1-2: start at depth 2
+	// Workers 3-5: start at depth 3
+	// Workers 6+: start at depth 4
+	startDepth := 1
+	if workerID >= 6 {
+		startDepth = 4
+	} else if workerID >= 3 {
+		startDepth = 3
+	} else if workerID >= 1 {
+		startDepth = 2
+	}
+
+	for depth := startDepth; depth <= maxDepth; depth++ {
 		if e.stopFlag.Load() {
 			return
 		}
@@ -331,8 +501,9 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 		var score int
 
 		// Use aspiration windows after depth 4
+		// Vary window by worker ID for search diversity
 		if depth >= 5 && prevScore != 0 {
-			window := 50
+			window := 50 + (workerID%8)*5 // Workers use slightly different windows
 			alpha := prevScore - window
 			beta := prevScore + window
 
@@ -411,6 +582,19 @@ func (e *Engine) SearchMultiPV(pos *board.Position, limits SearchLimits) []Searc
 			Depth: depth,
 		})
 		excludedMoves = append(excludedMoves, move)
+	}
+
+	// Sort results by score (descending) to ensure best moves are first
+	for i := 0; i < len(results)-1; i++ {
+		maxIdx := i
+		for j := i + 1; j < len(results); j++ {
+			if results[j].Score > results[maxIdx].Score {
+				maxIdx = j
+			}
+		}
+		if maxIdx != i {
+			results[i], results[maxIdx] = results[maxIdx], results[i]
+		}
 	}
 
 	return results

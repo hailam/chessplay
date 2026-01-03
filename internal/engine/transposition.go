@@ -29,6 +29,7 @@ type TTEntry struct {
 	Depth    int8       // Search depth
 	Flag     TTFlag     // Type of bound
 	Age      uint8      // Generation for replacement
+	IsPV     bool       // True if this entry was on the principal variation
 }
 
 // TranspositionTable is a hash table for storing search results.
@@ -99,26 +100,51 @@ func (tt *TranspositionTable) Probe(hash uint64) (TTEntry, bool) {
 }
 
 // Store saves a position in the transposition table.
-func (tt *TranspositionTable) Store(hash uint64, depth int, score int, flag TTFlag, bestMove board.Move) {
+// isPV indicates if this position was on the principal variation.
+func (tt *TranspositionTable) Store(hash uint64, depth int, score int, flag TTFlag, bestMove board.Move, isPV bool) {
 	idx := hash & tt.mask
 	shard := tt.shardIndex(idx)
 
 	tt.shards[shard].Lock()
 	entry := &tt.entries[idx]
-
-	// Replacement strategy:
-	// - Always replace if new entry is from current search and deeper or equal depth
-	// - Always replace if existing entry is from old search
-	// - Never replace if existing entry is deeper and from current search
-
 	currentAge := uint8(tt.age.Load())
-	if entry.Age != currentAge || depth >= int(entry.Depth) {
-		entry.Key = hash // Store full 64-bit hash
+
+	// Quality-based replacement strategy (similar to Stockfish):
+	// Quality = depth*4 + ageBonus + exactBonus + pvBonus
+	// Higher quality entries are preferred
+
+	// Calculate existing entry quality
+	existingQuality := int(entry.Depth) * 4
+	if entry.Age == currentAge {
+		existingQuality += 256 // Current age bonus
+	}
+	if entry.Flag == TTExact {
+		existingQuality += 2 // Exact score bonus
+	}
+	if entry.IsPV {
+		existingQuality += 4 // PV bonus
+	}
+
+	// Calculate new entry quality
+	newQuality := depth * 4
+	newQuality += 256 // New entry is always current age
+	if flag == TTExact {
+		newQuality += 2
+	}
+	if isPV {
+		newQuality += 4
+	}
+
+	// Replace if new entry has higher or equal quality,
+	// or if the keys match (update same position)
+	if newQuality >= existingQuality || entry.Key == hash {
+		entry.Key = hash
 		entry.BestMove = bestMove
 		entry.Score = int16(score)
 		entry.Depth = int8(depth)
 		entry.Flag = flag
 		entry.Age = currentAge
+		entry.IsPV = isPV
 	}
 	tt.shards[shard].Unlock()
 }

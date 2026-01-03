@@ -2,21 +2,35 @@ package engine
 
 import (
 	"log"
+	"math"
 	"sync/atomic"
 
 	"github.com/hailam/chessplay/internal/board"
 	"github.com/hailam/chessplay/sfnnue"
 )
 
+// LMR reduction table - precomputed logarithmic reductions
+// Based on Stockfish's formula: 21.46 * log(depth) * log(moveCount) / 1024
+var lmrReductions [64][64]int
+
+func init() {
+	for d := 1; d < 64; d++ {
+		for m := 1; m < 64; m++ {
+			// Stockfish-like formula
+			lmrReductions[d][m] = int(21.46 * math.Log(float64(d)) * math.Log(float64(m)) / 1024.0)
+		}
+	}
+}
+
 // Worker represents a search worker for parallel Lazy SMP search.
-// Each worker has its own state but shares the transposition table.
+// Each worker has its own state but shares the transposition table and history.
 type Worker struct {
 	id int
 
 	// Per-worker position copy
 	pos *board.Position
 
-	// Per-worker move ordering (killers, history diverge naturally)
+	// Per-worker move ordering (killers stay local, history shared)
 	orderer *MoveOrderer
 
 	// Per-worker search state
@@ -35,9 +49,11 @@ type Worker struct {
 	excludedRootMoves []board.Move
 
 	// Shared resources (pointers to engine's shared state)
-	tt        *TranspositionTable
-	pawnTable *PawnTable
-	stopFlag  *atomic.Bool
+	tt            *TranspositionTable
+	pawnTable     *PawnTable
+	sharedHistory *SharedHistory    // Shared history for Lazy SMP
+	corrHistory   *CorrectionHistory // Correction history for eval adjustment
+	stopFlag      *atomic.Bool
 
 	// NNUE evaluation (per-worker for thread safety)
 	useNNUE  bool
@@ -62,13 +78,15 @@ type WorkerResult struct {
 }
 
 // NewWorker creates a new search worker.
-func NewWorker(id int, tt *TranspositionTable, pawnTable *PawnTable, stopFlag *atomic.Bool) *Worker {
+func NewWorker(id int, tt *TranspositionTable, pawnTable *PawnTable, sharedHistory *SharedHistory, stopFlag *atomic.Bool) *Worker {
 	return &Worker{
-		id:        id,
-		orderer:   NewMoveOrderer(),
-		tt:        tt,
-		pawnTable: pawnTable,
-		stopFlag:  stopFlag,
+		id:            id,
+		orderer:       NewMoveOrderer(),
+		tt:            tt,
+		pawnTable:     pawnTable,
+		sharedHistory: sharedHistory,
+		corrHistory:   NewCorrectionHistory(),
+		stopFlag:      stopFlag,
 	}
 }
 
@@ -251,9 +269,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 
 	// Probe transposition table
 	var ttMove board.Move
+	ttPv := false // Track if TT indicates this is a PV node
 	ttEntry, found := w.tt.Probe(w.pos.Hash)
 	if found {
 		ttMove = ttEntry.BestMove
+		ttPv = ttEntry.IsPV
 
 		// Validate TT move before using (safety check for any edge cases)
 		if ttMove != board.NoMove {
@@ -329,7 +349,10 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 	}
 
 	// Static evaluation for pruning decisions
-	staticEval := w.evaluate()
+	rawEval := w.evaluate()
+	// Apply correction history adjustment
+	correction := w.corrHistory.Get(w.pos)
+	staticEval := rawEval + correction
 	w.evalStack[ply] = staticEval
 
 	// Improving heuristic
@@ -339,7 +362,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 	}
 
 	// Reverse Futility Pruning
-	if !inCheck && depth <= 6 && ply > 0 {
+	// Reduce aggressiveness in PV nodes (ttPv)
+	if !inCheck && depth <= 6 && ply > 0 && !ttPv {
 		rfpMargin := 80 * depth
 		if !improving {
 			rfpMargin -= 20
@@ -361,7 +385,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 	}
 
 	// Null Move Pruning
-	if !inCheck && depth >= 3 && ply > 0 && w.pos.HasNonPawnMaterial() {
+	// Don't do NMP in PV nodes to preserve principal variation
+	if !inCheck && depth >= 3 && ply > 0 && !ttPv && w.pos.HasNonPawnMaterial() {
 		R := 2 + depth/4
 		if R > depth-1 {
 			R = depth - 1
@@ -548,14 +573,38 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			newDepth += singularExtension
 		}
 
-		// Late Move Reduction (LMR)
+		// Late Move Reduction (LMR) - logarithmic formula based on Stockfish
 		if movesSearched > 4 && depth >= 3 && !inCheck && !isCapture && !isPromotion {
-			reduction := 1
-			if movesSearched > 10 {
-				reduction = 2
+			// Get base reduction from precomputed table
+			d := depth
+			if d > 63 {
+				d = 63
 			}
-			if depth > 6 {
+			m := movesSearched
+			if m > 63 {
+				m = 63
+			}
+			reduction := lmrReductions[d][m]
+
+			// Adjustments
+			if !improving {
 				reduction++
+			}
+			if move == ttMove {
+				reduction -= 2
+			}
+
+			// History-based adjustment (combine local and shared history)
+			from := move.From()
+			to := move.To()
+			localHist := w.orderer.history[from][to]
+			sharedHist := w.sharedHistory.Get(int(from), int(to))
+			histScore := (localHist + sharedHist) / 2 // Average of local and shared
+			reduction -= histScore / 8192
+
+			// Ensure reduction is reasonable
+			if reduction < 1 {
+				reduction = 1
 			}
 
 			reducedDepth := newDepth - reduction
@@ -608,7 +657,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 				w.pv.length[0] = 1
 			}
 
-			w.tt.Store(w.pos.Hash, depth, AdjustScoreToTT(score, ply), TTLowerBound, bestMove)
+			w.tt.Store(w.pos.Hash, depth, AdjustScoreToTT(score, ply), TTLowerBound, bestMove, false)
 
 			if isCapture {
 				attackerPiece := w.pos.PieceAt(move.From())
@@ -625,6 +674,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			} else {
 				w.orderer.UpdateKillers(move, ply)
 				w.orderer.UpdateHistory(move, depth, true)
+				// Update low-ply history for better root move ordering
+				w.orderer.UpdateLowPlyHistory(move, ply, depth, true)
+				// Also update shared history for Lazy SMP collective learning
+				bonus := depth * depth
+				w.sharedHistory.Update(int(move.From()), int(move.To()), bonus)
 				w.orderer.UpdateCounterMove(prevMove, move, w.pos)
 
 				if prevMove != board.NoMove {
@@ -646,7 +700,15 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	w.tt.Store(w.pos.Hash, depth, AdjustScoreToTT(bestScore, ply), flag, bestMove)
+	// Update correction history when we have an exact score
+	// This helps the engine learn from eval errors
+	if flag == TTExact && !inCheck && depth >= 2 {
+		w.corrHistory.Update(w.pos, bestScore, rawEval, depth)
+	}
+
+	// isPV = true when we found an exact score (improved alpha without beta cutoff)
+	isPV := flag == TTExact
+	w.tt.Store(w.pos.Hash, depth, AdjustScoreToTT(bestScore, ply), flag, bestMove, isPV)
 
 	return bestScore
 }

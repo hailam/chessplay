@@ -50,9 +50,10 @@ type Searcher struct {
 
 // NewSearcher creates a new searcher.
 func NewSearcher(tt *TranspositionTable) *Searcher {
-	pawnTable := NewPawnTable(1) // 1MB pawn hash table
+	pawnTable := NewPawnTable(1)       // 1MB pawn hash table
+	sharedHistory := NewSharedHistory() // Own history for single-threaded search
 	s := &Searcher{}
-	s.worker = NewWorker(0, tt, pawnTable, &s.stopFlag)
+	s.worker = NewWorker(0, tt, pawnTable, sharedHistory, &s.stopFlag)
 	return s
 }
 

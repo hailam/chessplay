@@ -6,6 +6,7 @@ package sfnnue
 import (
 	"fmt"
 	"io"
+	"unsafe"
 
 	"github.com/hailam/chessplay/sfnnue/features"
 )
@@ -251,16 +252,33 @@ func (ft *FeatureTransformer) ComputeAccumulator(
 }
 
 // UpdateAccumulator incrementally updates the accumulator (in-place).
-// Uses SIMD for the hot int16 loops.
+// Uses SIMD for the hot int16 loops and prefetching for better cache performance.
 func (ft *FeatureTransformer) UpdateAccumulator(
 	removedIndices, addedIndices []int,
 	accumulation []int16,
 	psqtAccumulation []int32,
 ) {
+	// Calculate number of cache lines per feature weight access
+	// HalfDimensions * 2 bytes (int16) / 64 bytes per cache line
+	linesPerFeature := (ft.HalfDimensions * 2) / 64
+	if linesPerFeature < 1 {
+		linesPerFeature = 1
+	}
+
 	// Remove old features (SIMD accelerated)
-	for _, idx := range removedIndices {
+	for i, idx := range removedIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
 			offset := idx * ft.HalfDimensions
+
+			// Prefetch next feature's weights
+			if i+1 < len(removedIndices) {
+				nextIdx := removedIndices[i+1]
+				if nextIdx >= 0 && nextIdx < ft.InputDimensions {
+					nextOffset := nextIdx * ft.HalfDimensions
+					PrefetchLines(unsafe.Pointer(&ft.Weights[nextOffset]), linesPerFeature)
+				}
+			}
+
 			SIMDSubInt16Offset(accumulation, ft.Weights, offset, ft.HalfDimensions)
 
 			// PSQT is only 8 elements, not worth SIMD
@@ -272,9 +290,19 @@ func (ft *FeatureTransformer) UpdateAccumulator(
 	}
 
 	// Add new features (SIMD accelerated)
-	for _, idx := range addedIndices {
+	for i, idx := range addedIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
 			offset := idx * ft.HalfDimensions
+
+			// Prefetch next feature's weights
+			if i+1 < len(addedIndices) {
+				nextIdx := addedIndices[i+1]
+				if nextIdx >= 0 && nextIdx < ft.InputDimensions {
+					nextOffset := nextIdx * ft.HalfDimensions
+					PrefetchLines(unsafe.Pointer(&ft.Weights[nextOffset]), linesPerFeature)
+				}
+			}
+
 			SIMDAddInt16Offset(accumulation, ft.Weights, offset, ft.HalfDimensions)
 
 			// PSQT is only 8 elements, not worth SIMD

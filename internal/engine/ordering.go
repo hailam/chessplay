@@ -1,8 +1,55 @@
 package engine
 
 import (
+	"sync/atomic"
+
 	"github.com/hailam/chessplay/internal/board"
 )
+
+// SharedHistory provides thread-safe shared history tables for Lazy SMP.
+// Workers read and update atomically, allowing collective learning across threads.
+type SharedHistory struct {
+	// Butterfly history [from][to] - flattened for atomic access
+	history [64 * 64]atomic.Int32
+}
+
+// NewSharedHistory creates a new shared history table.
+func NewSharedHistory() *SharedHistory {
+	return &SharedHistory{}
+}
+
+// Get returns the history score for a move.
+func (sh *SharedHistory) Get(from, to int) int {
+	return int(sh.history[from*64+to].Load())
+}
+
+// Update atomically updates the history score for a move.
+func (sh *SharedHistory) Update(from, to, bonus int) {
+	idx := from*64 + to
+	for {
+		old := sh.history[idx].Load()
+		newVal := old + int32(bonus)
+
+		// Clamp to prevent overflow
+		if newVal > 400000 {
+			newVal = 400000
+		} else if newVal < -400000 {
+			newVal = -400000
+		}
+
+		if sh.history[idx].CompareAndSwap(old, newVal) {
+			break
+		}
+	}
+}
+
+// Age scales down all history scores (called between searches).
+func (sh *SharedHistory) Age() {
+	for i := range sh.history {
+		old := sh.history[i].Load()
+		sh.history[i].Store(old / 2)
+	}
+}
 
 // Move ordering priorities
 const (
@@ -26,6 +73,9 @@ var mvvLva = [6][6]int{
 	/* K */ {0, 0, 0, 0, 0, 0},       // King can't be captured
 }
 
+// MaxLowPly is the maximum ply for low-ply history tracking
+const MaxLowPly = 5
+
 // MoveOrderer handles move ordering for the search.
 type MoveOrderer struct {
 	// Killer moves (quiet moves that caused beta cutoffs)
@@ -33,6 +83,10 @@ type MoveOrderer struct {
 
 	// History heuristic (indexed by [from][to])
 	history [64][64]int
+
+	// Low-ply history (indexed by [ply][from][to]) for plies 0-4
+	// Special handling for root moves and early search depths
+	lowPlyHistory [MaxLowPly][64][64]int
 
 	// Counter move heuristic (indexed by [piece][to])
 	counterMoves [12][64]board.Move
@@ -61,6 +115,15 @@ func (mo *MoveOrderer) Clear() {
 	for i := range mo.history {
 		for j := range mo.history[i] {
 			mo.history[i][j] /= 2
+		}
+	}
+
+	// Age low-ply history
+	for p := range mo.lowPlyHistory {
+		for i := range mo.lowPlyHistory[p] {
+			for j := range mo.lowPlyHistory[p][i] {
+				mo.lowPlyHistory[p][i][j] /= 2
+			}
 		}
 	}
 
@@ -199,7 +262,14 @@ func (mo *MoveOrderer) scoreMove(pos *board.Position, m board.Move, ply int, ttM
 	}
 
 	// History heuristic for quiet moves
-	return mo.history[from][to]
+	histScore := mo.history[from][to]
+
+	// Add low-ply history bonus for plies 0-4
+	if ply < MaxLowPly {
+		histScore += mo.lowPlyHistory[ply][from][to] / 2
+	}
+
+	return histScore
 }
 
 // SortMoves sorts moves by their scores (descending).
@@ -275,6 +345,40 @@ func (mo *MoveOrderer) UpdateHistory(m board.Move, depth int, isGood bool) {
 		mo.history[from][to] -= bonus
 		if mo.history[from][to] < -400000 {
 			mo.history[from][to] = -400000
+		}
+	}
+}
+
+// UpdateLowPlyHistory updates the low-ply history for moves at plies 0-4.
+// This helps with root move ordering across iterations.
+func (mo *MoveOrderer) UpdateLowPlyHistory(m board.Move, ply, depth int, isGood bool) {
+	if ply >= MaxLowPly {
+		return
+	}
+
+	from := m.From()
+	to := m.To()
+	bonus := depth * depth
+
+	if isGood {
+		mo.lowPlyHistory[ply][from][to] += bonus
+		if mo.lowPlyHistory[ply][from][to] > 400000 {
+			mo.scaleLowPlyHistory()
+		}
+	} else {
+		mo.lowPlyHistory[ply][from][to] -= bonus
+		if mo.lowPlyHistory[ply][from][to] < -400000 {
+			mo.lowPlyHistory[ply][from][to] = -400000
+		}
+	}
+}
+
+func (mo *MoveOrderer) scaleLowPlyHistory() {
+	for p := range mo.lowPlyHistory {
+		for i := range mo.lowPlyHistory[p] {
+			for j := range mo.lowPlyHistory[p][i] {
+				mo.lowPlyHistory[p][i][j] /= 2
+			}
 		}
 	}
 }
