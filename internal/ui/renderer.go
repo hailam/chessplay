@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image/color"
+	"math"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
@@ -235,3 +236,85 @@ func (r *Renderer) Theme() *Theme {
 func (r *Renderer) Sprites() *SpriteManager {
 	return r.sprites
 }
+
+// HintColor is the color used for hint arrows and highlights.
+var HintColor = color.RGBA{76, 175, 120, 180}       // Green
+var HintHighlightFrom = color.RGBA{76, 175, 120, 60}  // Light green for source
+var HintHighlightTo = color.RGBA{76, 175, 120, 100}   // Slightly darker for destination
+
+// DrawHintArrow draws a visual hint arrow from one square to another.
+func (r *Renderer) DrawHintArrow(screen *ebiten.Image, from, to board.Square) {
+	if from == board.NoSquare || to == board.NoSquare {
+		return
+	}
+
+	// Highlight source and destination squares
+	r.highlightSquare(screen, from, HintHighlightFrom)
+	r.highlightSquare(screen, to, HintHighlightTo)
+
+	// Get center positions
+	fx, fy := r.squareCenter(from)
+	tx, ty := r.squareCenter(to)
+
+	// Draw arrow line
+	lineWidth := r.s(r.squareSize) * 0.08
+	vector.StrokeLine(screen, fx, fy, tx, ty, lineWidth, HintColor, false)
+
+	// Draw arrowhead
+	r.drawArrowhead(screen, fx, fy, tx, ty, HintColor)
+}
+
+// squareCenter returns the center coordinates of a square (scaled).
+func (r *Renderer) squareCenter(sq board.Square) (float32, float32) {
+	x, y := r.SquareToScreen(sq)
+	cx := r.s(x) + r.s(r.squareSize)/2
+	cy := r.s(y) + r.s(r.squareSize)/2
+	return cx, cy
+}
+
+// drawArrowhead draws an arrowhead at the destination point.
+func (r *Renderer) drawArrowhead(screen *ebiten.Image, fx, fy, tx, ty float32, c color.RGBA) {
+	// Calculate angle from source to destination
+	angle := math.Atan2(float64(ty-fy), float64(tx-fx))
+
+	// Arrowhead size
+	headSize := r.s(r.squareSize) * 0.25
+	headAngle := math.Pi / 6 // 30 degrees
+
+	// Calculate arrowhead points
+	// Pull back slightly from destination center
+	pullback := r.s(r.squareSize) * 0.15
+	tipX := tx - float32(math.Cos(angle))*pullback
+	tipY := ty - float32(math.Sin(angle))*pullback
+
+	// Left point of arrowhead
+	leftX := tipX - float32(math.Cos(angle-headAngle))*headSize
+	leftY := tipY - float32(math.Sin(angle-headAngle))*headSize
+
+	// Right point of arrowhead
+	rightX := tipX - float32(math.Cos(angle+headAngle))*headSize
+	rightY := tipY - float32(math.Sin(angle+headAngle))*headSize
+
+	// Draw filled triangle for arrowhead
+	path := vector.Path{}
+	path.MoveTo(tipX, tipY)
+	path.LineTo(leftX, leftY)
+	path.LineTo(rightX, rightY)
+	path.Close()
+
+	vs, is := path.AppendVerticesAndIndicesForFilling(nil, nil)
+	for i := range vs {
+		vs[i].ColorR = float32(c.R) / 255
+		vs[i].ColorG = float32(c.G) / 255
+		vs[i].ColorB = float32(c.B) / 255
+		vs[i].ColorA = float32(c.A) / 255
+	}
+	screen.DrawTriangles(vs, is, emptyImage, nil)
+}
+
+// emptyImage is a 1x1 white image used for solid color drawing.
+var emptyImage = func() *ebiten.Image {
+	img := ebiten.NewImage(1, 1)
+	img.Fill(color.White)
+	return img
+}()

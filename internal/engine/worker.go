@@ -228,6 +228,11 @@ func (w *Worker) isDraw() bool {
 
 // negamax implements the negamax algorithm with alpha-beta pruning.
 func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) int {
+	// Bounds check to prevent array overflow (can happen with high depth + extensions)
+	if ply >= MaxPly {
+		return w.evaluate()
+	}
+
 	// Check for stop signal periodically
 	if w.nodes&4095 == 0 && w.stopFlag.Load() {
 		return 0

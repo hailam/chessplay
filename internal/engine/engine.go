@@ -2,6 +2,7 @@ package engine
 
 import (
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,8 +13,8 @@ import (
 	"github.com/hailam/chessplay/sfnnue"
 )
 
-// NumWorkers is the number of parallel search workers.
-const NumWorkers = 4
+// NumWorkers is the number of parallel search workers (matches CPU cores).
+var NumWorkers = runtime.GOMAXPROCS(0)
 
 // SearchInfo contains information about the current search.
 type SearchInfo struct {
@@ -48,20 +49,20 @@ type Difficulty int
 const (
 	Easy   Difficulty = iota // ~2-3 ply, 500ms
 	Medium                   // ~4-5 ply, 2s
-	Hard                     // ~6+ ply, 5s
+	Hard                     // Maximum strength, 10s
 )
 
 // DifficultySettings maps difficulty to search limits.
 var DifficultySettings = map[Difficulty]SearchLimits{
 	Easy:   {Depth: 3, MoveTime: 500 * time.Millisecond},
-	Medium: {Depth: 5, MoveTime: 2 * time.Second},
-	Hard:   {Depth: 7, MoveTime: 5 * time.Second},
+	Medium: {Depth: 7, MoveTime: 1 * time.Second},
+	Hard:   {Depth: 40, MoveTime: 3 * time.Second}, // Max strength (time-limited)
 }
 
 // Engine is the chess AI engine.
 type Engine struct {
 	// Workers for parallel search
-	workers   [NumWorkers]*Worker
+	workers   []*Worker
 	pawnTable *PawnTable
 	tt        *TranspositionTable
 	stopFlag  atomic.Bool
@@ -92,7 +93,10 @@ func NewEngine(ttSizeMB int) *Engine {
 		tt:         tt,
 		pawnTable:  NewPawnTable(1), // Shared pawn table for legacy searcher
 		difficulty: Medium,
+		workers:    make([]*Worker, NumWorkers),
 	}
+
+	log.Printf("[Engine] Creating %d workers (GOMAXPROCS=%d)", NumWorkers, runtime.GOMAXPROCS(0))
 
 	// Create workers, each with its own pawn table for thread safety
 	for i := 0; i < NumWorkers; i++ {
@@ -248,7 +252,7 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 	var totalNodes uint64
 
 	// Process results
-	resultLoop:
+resultLoop:
 	for {
 		select {
 		case result, ok := <-resultCh:

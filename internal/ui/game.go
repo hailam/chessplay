@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hailam/chessplay/internal/board"
@@ -47,6 +48,12 @@ const (
 	EvalClassical EvalMode = iota
 	EvalNNUE
 )
+
+// AssistResult holds the analysis result for Easy mode hints.
+type AssistResult struct {
+	Evaluation int        // Centipawn score
+	BestMove   board.Move // Suggested move
+}
 
 // Game implements ebiten.Game interface.
 type Game struct {
@@ -93,6 +100,12 @@ type Game struct {
 	aiThinking bool
 	aiMove     chan board.Move
 
+	// Easy mode assistance
+	assistResult  *AssistResult
+	assistRunning bool
+	assistCh      chan *AssistResult
+	showHints     bool // Toggle for hint visibility
+
 	// Game state
 	gameOver   bool
 	gameResult string
@@ -114,6 +127,8 @@ func NewGame() *Game {
 		input:          NewInputHandler(),
 		engine:         engine.NewEngine(64), // 64MB hash table
 		aiMove:         make(chan board.Move, 1),
+		assistCh:       make(chan *AssistResult, 1),
+		showHints:      true, // Enable hints by default in Easy mode
 	}
 
 	// Initialize storage
@@ -286,6 +301,12 @@ func (g *Game) Update() error {
 	// Check for AI move
 	g.checkAIMove()
 
+	// Check for assist analysis result (Easy mode)
+	g.checkAssistResult()
+
+	// Start assist analysis if it's user's turn in Easy mode
+	g.startAssistAnalysis()
+
 	// Update cursor based on hover state
 	g.updateCursor()
 
@@ -331,6 +352,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	// Draw highlights (last move, selection, legal moves)
 	g.renderer.DrawHighlights(screen, g.selectedSquare, g.legalMoves, g.lastMove)
+
+	// Draw hint arrow (Easy mode only)
+	if g.difficulty == DifficultyEasy && g.showHints && g.assistResult != nil {
+		g.renderer.DrawHintArrow(screen, g.assistResult.BestMove.From(), g.assistResult.BestMove.To())
+	}
 
 	// Draw pieces with shake animations
 	g.renderer.DrawPiecesWithAnimations(screen, g.position, g.dragging, g.dragSquare, g.feedback.Animations())
@@ -583,6 +609,9 @@ func (g *Game) makeMove(m board.Move) {
 	// Clear selection
 	g.clearSelection()
 
+	// Clear assist (will re-analyze after AI moves)
+	g.clearAssist()
+
 	// Update checkers
 	g.position.UpdateCheckers()
 
@@ -707,6 +736,7 @@ func (g *Game) NewGameAction() {
 	g.positionHashes = []uint64{g.position.Hash} // Reset with starting position
 	g.lastMove = board.NoMove
 	g.clearSelection()
+	g.clearAssist()
 	g.gameOver = false
 	g.gameResult = ""
 	g.aiThinking = false
@@ -873,5 +903,76 @@ func (g *Game) setEvalMode(mode EvalMode) {
 func (g *Game) Close() {
 	if g.storage != nil {
 		g.storage.Close()
+	}
+}
+
+// startAssistAnalysis starts background analysis for Easy mode hints.
+// Only runs when it's the user's turn and difficulty is Easy.
+func (g *Game) startAssistAnalysis() {
+	// Only in Easy mode
+	if g.difficulty != DifficultyEasy {
+		return
+	}
+	// Only when it's human's turn (White in HvC mode)
+	if g.mode == ModeHumanVsComputer && g.position.SideToMove != board.White {
+		return
+	}
+	// Don't run if game is over or AI is thinking
+	if g.gameOver || g.aiThinking {
+		return
+	}
+	// Don't run if already have a result (wait until move is made)
+	if g.assistResult != nil {
+		return
+	}
+	// Don't run if already analyzing
+	if g.assistRunning {
+		return
+	}
+
+	log.Printf("[Assist] Starting analysis for Easy mode hint")
+	g.assistRunning = true
+
+	go func() {
+		// Quick search to find best move
+		limits := engine.SearchLimits{
+			Depth:    5,
+			MoveTime: 500 * time.Millisecond,
+		}
+		pos := g.position.Copy()
+		bestMove := g.engine.SearchWithLimits(pos, limits)
+		eval := g.engine.Evaluate(pos)
+
+		g.assistCh <- &AssistResult{
+			Evaluation: eval,
+			BestMove:   bestMove,
+		}
+	}()
+}
+
+// checkAssistResult checks for completed assist analysis.
+func (g *Game) checkAssistResult() {
+	if !g.assistRunning {
+		return
+	}
+
+	select {
+	case result := <-g.assistCh:
+		g.assistRunning = false
+		g.assistResult = result
+		log.Printf("[Assist] Result received: eval=%d, move=%v", result.Evaluation, result.BestMove)
+	default:
+		// Still analyzing
+	}
+}
+
+// clearAssist clears the current assist result.
+func (g *Game) clearAssist() {
+	g.assistResult = nil
+	g.assistRunning = false
+	// Drain channel if anything pending
+	select {
+	case <-g.assistCh:
+	default:
 	}
 }

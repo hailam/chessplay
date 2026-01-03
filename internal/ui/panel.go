@@ -3,10 +3,12 @@ package ui
 import (
 	"fmt"
 	"image/color"
+	"log"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/text/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
+	"github.com/hailam/chessplay/internal/engine"
 )
 
 // Panel dimensions
@@ -233,6 +235,11 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 		totalRows := (len(moves) + 1) / 2
 		rowHeight := 22
 		contentHeight := totalRows * rowHeight
+		if contentHeight == 0 {
+			p.maxScrollY = 0 // Reset scroll state when no moves
+			p.scrollY = 0
+			goto skipScrollbar
+		}
 		indicatorH := visibleHeight * visibleHeight / contentHeight
 		if indicatorH < 20 {
 			indicatorH = 20
@@ -274,6 +281,7 @@ func (p *Panel) HandleInput(input *InputHandler) bool {
 			}
 		}
 	}
+skipScrollbar:
 
 	// Check other buttons for hover
 	p.newGameBtn.hovered = p.isInside(mx, my, p.newGameBtn)
@@ -399,8 +407,16 @@ func (p *Panel) Draw(screen *ebiten.Image, r *Renderer, glass *GlassEffect) {
 		p.drawDifficultyTabs(screen)
 	}
 
+	// Draw hint section (Easy mode only, when hints are available)
+	hintSectionH := 0
+	if p.game.difficulty == DifficultyEasy && p.game.showHints && p.game.assistResult != nil {
+		log.Printf("[Panel] Drawing hint section: eval=%d, move=%v", p.game.assistResult.Evaluation, p.game.assistResult.BestMove)
+		hintY := p.getHistoryStartY()
+		hintSectionH = p.drawAssistance(screen, hintY)
+	}
+
 	// Draw move history section
-	historyY := p.getHistoryStartY()
+	historyY := p.getHistoryStartY() + hintSectionH
 	p.drawSectionLabel(screen, "Moves", BoardSize+PanelPadding, historyY)
 	p.drawMoveHistory(screen, historyY+SectionLabelH+4)
 
@@ -745,4 +761,34 @@ func (p *Panel) toggleCollapse() {
 	} else {
 		ebiten.SetWindowSize(ScreenWidth, ScreenHeight)
 	}
+}
+
+// drawAssistance draws the Easy mode hint section.
+// Returns the height of the section (for layout purposes).
+func (p *Panel) drawAssistance(screen *ebiten.Image, y int) int {
+	assist := p.game.assistResult
+	if assist == nil {
+		return 0
+	}
+
+	contentX := BoardSize + PanelPadding
+	startY := y
+
+	// Section label
+	p.drawSectionLabel(screen, "Hint", contentX, y)
+	y += SectionLabelH + 4
+
+	// Section background
+	sectionH := 52
+	vector.DrawFilledRect(screen, p.s(contentX-4), p.s(y), p.s(PanelWidth-PanelPadding*2+8), p.s(sectionH), sectionBg, false)
+
+	// Evaluation score
+	scoreStr := engine.ScoreToString(assist.Evaluation)
+	p.drawText(screen, "Eval: "+scoreStr, contentX, y+4, textPrimary)
+
+	// Best move suggestion
+	moveStr := assist.BestMove.String()
+	p.drawText(screen, "Try: "+moveStr, contentX, y+26, accentColor)
+
+	return y + sectionH + SectionSpacing - startY
 }
