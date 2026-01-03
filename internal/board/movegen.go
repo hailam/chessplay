@@ -1,6 +1,9 @@
 package board
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+)
 
 // GenerateLegalMoves generates all legal moves for the position.
 func (p *Position) GenerateLegalMoves() *MoveList {
@@ -673,6 +676,13 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 
 	// Safety check - if no piece at from square, return without modifying position
 	if piece == NoPiece {
+		return undo
+	}
+
+	// Validate piece belongs to side to move - critical for catching bugs
+	if piece.Color() != us {
+		log.Printf("ERROR: MakeMove - trying to move %v piece when %v to move! Move: %v (from=%v to=%v)",
+			piece.Color(), us, m, from, to)
 		return undo
 	}
 

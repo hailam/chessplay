@@ -59,34 +59,93 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 }
 `)
 
-// Kage shader for liquid glass refraction + tint
+// Kage shader for liquid glass with SDF, fresnel, chromatic aberration
 var liquidGlassShader = []byte(`
 //kage:unit pixels
 
 package main
 
 var Time float
+var CenterX float
+var CenterY float
+var Width float
+var Height float
+var CornerRadius float
 var TintR float
 var TintG float
 var TintB float
 var TintA float
-var RefractionStrength float
+
+// Rounded rectangle SDF
+func sdRoundedRect(p vec2, size vec2, r float) float {
+    q := abs(p) - size + vec2(r, r)
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r
+}
+
+// Fresnel (Schlick approximation)
+func fresnelSchlick(cosTheta float) float {
+    r0 := 0.04
+    return r0 + (1.0 - r0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0)
+}
 
 func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
-    // Subtle wave distortion for liquid glass effect
-    distortion := vec2(
-        sin(srcPos.y * 0.03 + Time * 1.5) * RefractionStrength,
-        cos(srcPos.x * 0.03 + Time * 1.2) * RefractionStrength * 0.7,
-    )
+    center := vec2(CenterX, CenterY)
+    size := vec2(Width, Height) * 0.5
+    p := srcPos - center
 
-    // Sample blurred background with refraction offset
-    blurred := imageSrc0At(srcPos + distortion)
+    // Distance to rounded rect
+    d := sdRoundedRect(p, size, CornerRadius)
 
-    // Apply tint overlay
-    tint := vec4(TintR, TintG, TintB, TintA)
+    // Drop shadow (offset SDF)
+    shadowOffset := vec2(0.0, 4.0)
+    shadowD := sdRoundedRect(p - shadowOffset, size, CornerRadius)
+    shadowMask := 1.0 - smoothstep(-8.0, 0.0, shadowD)
+    shadowMask *= 0.15
 
-    // Mix blurred background with tint color based on tint alpha
-    return mix(blurred, vec4(tint.rgb, 1.0), tint.a)
+    // Inside the glass
+    if d < 0.0 {
+        // Distance from edge (for fresnel)
+        minSize := min(size.x, size.y)
+        edgeDist := -d / (minSize * 0.5)
+        edgeDist = clamp(edgeDist, 0.0, 1.0)
+
+        // Lens distortion (magnify center, distort edges)
+        distortStrength := 0.02 * (1.0 - edgeDist)
+        offset := p * distortStrength
+
+        // Chromatic aberration
+        redUV := srcPos + offset * 0.9
+        greenUV := srcPos + offset * 1.0
+        blueUV := srcPos + offset * 1.1
+
+        r := imageSrc0At(redUV).r
+        g := imageSrc0At(greenUV).g
+        b := imageSrc0At(blueUV).b
+
+        refracted := vec3(r, g, b)
+
+        // Brighten slightly
+        refracted = refracted * 1.05 + vec3(0.02)
+
+        // Fresnel edge highlight
+        fresnelAmount := fresnelSchlick(edgeDist)
+        highlight := vec3(1.0, 1.0, 1.0) * fresnelAmount * 0.3
+
+        // Tint
+        tint := vec4(TintR, TintG, TintB, TintA)
+        finalColor := mix(refracted + highlight, tint.rgb, tint.a)
+
+        // Edge line (subtle white border)
+        edgeLine := smoothstep(-2.0, 0.0, d) * smoothstep(0.0, -1.0, d)
+        finalColor = mix(finalColor, vec3(1.0), edgeLine * 0.5)
+
+        return vec4(finalColor, 1.0)
+    }
+
+    // Outside - show background with shadow
+    bg := imageSrc0At(srcPos).rgb
+    bg = mix(bg, vec3(0.0), shadowMask)
+    return vec4(bg, 1.0)
 }
 `)
 
@@ -199,15 +258,20 @@ func (ge *GlassEffect) DrawGlass(screen *ebiten.Image, x, y, w, h int, tint colo
 	}
 	ge.tempH.DrawRectShader(w, h, ge.blurV, blurOpV)
 
-	// Apply liquid glass effect with refraction and tint, draw back to screen
+	// Apply liquid glass effect with SDF, fresnel, and chromatic aberration
+	// Center coordinates are relative to the shader's local coordinate system
 	glassOp := &ebiten.DrawRectShaderOptions{
 		Uniforms: map[string]interface{}{
-			"Time":               float32(ge.time),
-			"TintR":              float32(tint.R) / 255.0,
-			"TintG":              float32(tint.G) / 255.0,
-			"TintB":              float32(tint.B) / 255.0,
-			"TintA":              float32(tint.A) / 255.0,
-			"RefractionStrength": float32(refractionStrength),
+			"Time":         float32(ge.time),
+			"CenterX":      float32(w) / 2.0,
+			"CenterY":      float32(h) / 2.0,
+			"Width":        float32(w),
+			"Height":       float32(h),
+			"CornerRadius": float32(8.0), // Default corner radius
+			"TintR":        float32(tint.R) / 255.0,
+			"TintG":        float32(tint.G) / 255.0,
+			"TintB":        float32(tint.B) / 255.0,
+			"TintA":        float32(tint.A) / 255.0,
 		},
 		Images: [4]*ebiten.Image{ge.tempH},
 		GeoM:   ebiten.GeoM{},

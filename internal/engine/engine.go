@@ -1,12 +1,19 @@
 package engine
 
 import (
+	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hailam/chessplay/internal/board"
 	"github.com/hailam/chessplay/internal/book"
 	"github.com/hailam/chessplay/internal/tablebase"
+	"github.com/hailam/chessplay/sfnnue"
 )
+
+// NumWorkers is the number of parallel search workers.
+const NumWorkers = 4
 
 // SearchInfo contains information about the current search.
 type SearchInfo struct {
@@ -53,11 +60,25 @@ var DifficultySettings = map[Difficulty]SearchLimits{
 
 // Engine is the chess AI engine.
 type Engine struct {
-	searcher   *Searcher
-	tt         *TranspositionTable
+	// Workers for parallel search
+	workers   [NumWorkers]*Worker
+	pawnTable *PawnTable
+	tt        *TranspositionTable
+	stopFlag  atomic.Bool
+
+	// Legacy single-threaded searcher (for Multi-PV compatibility)
+	searcher *Searcher
+
 	difficulty Difficulty
 	book       *book.Book
 	tablebase  tablebase.Prober
+
+	// Position history for repetition detection
+	rootPosHashes []uint64
+
+	// NNUE evaluation
+	useNNUE bool
+	nnueNet *sfnnue.Networks // Shared networks (immutable after load)
 
 	// Callbacks
 	OnInfo func(SearchInfo)
@@ -66,11 +87,23 @@ type Engine struct {
 // NewEngine creates a new chess engine with the given transposition table size in MB.
 func NewEngine(ttSizeMB int) *Engine {
 	tt := NewTranspositionTable(ttSizeMB)
-	return &Engine{
-		searcher:   NewSearcher(tt),
+
+	e := &Engine{
 		tt:         tt,
+		pawnTable:  NewPawnTable(1), // Shared pawn table for legacy searcher
 		difficulty: Medium,
 	}
+
+	// Create workers, each with its own pawn table for thread safety
+	for i := 0; i < NumWorkers; i++ {
+		workerPawnTable := NewPawnTable(1) // 1MB per worker
+		e.workers[i] = NewWorker(i, tt, workerPawnTable, &e.stopFlag)
+	}
+
+	// Create legacy searcher for Multi-PV
+	e.searcher = NewSearcher(tt)
+
+	return e
 }
 
 // SetDifficulty sets the engine difficulty.
@@ -116,6 +149,15 @@ func (e *Engine) HasTablebase() bool {
 // SetPositionHistory sets the position history for repetition detection.
 // This should be called before Search() with hashes from the game's move history.
 func (e *Engine) SetPositionHistory(hashes []uint64) {
+	e.rootPosHashes = make([]uint64, len(hashes))
+	copy(e.rootPosHashes, hashes)
+
+	// Set for all workers
+	for _, w := range e.workers {
+		w.SetRootHistory(hashes)
+	}
+
+	// Set for legacy searcher
 	e.searcher.SetRootHistory(hashes)
 }
 
@@ -126,13 +168,17 @@ func (e *Engine) Search(pos *board.Position) board.Move {
 }
 
 // SearchWithLimits finds the best move with specific search limits.
+// Uses Lazy SMP with multiple workers searching in parallel.
 func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) board.Move {
+	log.Printf("[Search] Received position with SideToMove=%v", pos.SideToMove)
+
 	// Try opening book first
 	if e.book != nil {
 		if move, ok := e.book.Probe(pos); ok {
 			return move
 		}
 	}
+	log.Printf("[Search] After book probe SideToMove=%v", pos.SideToMove)
 
 	// Try tablebase for endgames
 	if e.tablebase != nil && e.tablebase.Available() {
@@ -144,13 +190,29 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 			}
 		}
 	}
+	log.Printf("[Search] After tablebase probe SideToMove=%v", pos.SideToMove)
 
-	e.searcher.Reset()
+	// Reset for new search
+	e.stopFlag.Store(false)
 	e.tt.NewSearch()
+
+	// Log evaluation mode
+	if e.useNNUE && e.nnueNet != nil {
+		log.Printf("[Engine] Starting search with NNUE evaluation")
+	} else {
+		log.Printf("[Engine] Starting search with Classical evaluation")
+	}
+
+	// Reset all workers
+	for _, w := range e.workers {
+		w.Reset()
+	}
 
 	startTime := time.Now()
 	var bestMove board.Move
 	var bestScore int
+	var bestPV []board.Move
+	var bestDepth int
 
 	// Determine maximum depth
 	maxDepth := MaxPly
@@ -164,97 +226,161 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 		deadline = startTime.Add(limits.MoveTime)
 	}
 
-	// Aspiration window parameters
-	const initialWindow = 50 // Start with ±50 centipawns
+	// Create result channel
+	resultCh := make(chan WorkerResult, NumWorkers*maxDepth)
 
-	// Iterative deepening
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < NumWorkers; i++ {
+		wg.Add(1)
+		go e.workerSearch(i, pos, maxDepth, resultCh, &wg)
+	}
+
+	// Collect results in a separate goroutine
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(resultCh)
+		close(done)
+	}()
+
+	// Track nodes across all workers
+	var totalNodes uint64
+
+	// Process results
+	resultLoop:
+	for {
+		select {
+		case result, ok := <-resultCh:
+			if !ok {
+				break resultLoop
+			}
+
+			// Update total nodes
+			totalNodes += result.Nodes
+
+			// Update best result if this is deeper or same depth with better score
+			if result.Move != board.NoMove {
+				if result.Depth > bestDepth ||
+					(result.Depth == bestDepth && result.Score > bestScore) {
+					bestMove = result.Move
+					bestScore = result.Score
+					bestPV = result.PV
+					bestDepth = result.Depth
+
+					// Report info
+					if e.OnInfo != nil {
+						elapsed := time.Since(startTime)
+						e.OnInfo(SearchInfo{
+							Depth:    bestDepth,
+							Score:    bestScore,
+							Nodes:    e.getTotalNodes(),
+							Time:     elapsed,
+							PV:       bestPV,
+							HashFull: e.tt.HashFull(),
+						})
+					}
+
+					// Early termination: found mate
+					if bestScore > MateScore-100 || bestScore < -MateScore+100 {
+						e.stopFlag.Store(true)
+						break resultLoop
+					}
+				}
+			}
+
+			// Check time limit
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				e.stopFlag.Store(true)
+				break resultLoop
+			}
+
+		case <-done:
+			break resultLoop
+		}
+	}
+
+	// Ensure all workers are stopped
+	e.stopFlag.Store(true)
+
+	// Wait for workers to finish
+	<-done
+
+	return bestMove
+}
+
+// workerSearch runs iterative deepening search in a worker goroutine.
+func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, resultCh chan<- WorkerResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	worker := e.workers[workerID]
+	worker.InitSearch(pos)
+
+	var prevScore int
+
 	for depth := 1; depth <= maxDepth; depth++ {
-		// Check time before starting new iteration
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			break
+		if e.stopFlag.Load() {
+			return
 		}
 
 		var move board.Move
 		var score int
 
-		// Use aspiration windows after depth 4 and when we have a previous score
-		if depth >= 5 && bestMove != board.NoMove {
-			window := initialWindow
-			alpha := bestScore - window
-			beta := bestScore + window
+		// Use aspiration windows after depth 4
+		if depth >= 5 && prevScore != 0 {
+			window := 50
+			alpha := prevScore - window
+			beta := prevScore + window
 
-			// Aspiration window search with widening
 			for {
-				move, score = e.searcher.SearchWithBounds(pos, depth, alpha, beta)
+				move, score = worker.SearchDepth(depth, alpha, beta)
 
-				// Check if search was stopped
-				if e.searcher.stopFlag.Load() {
-					break
+				if e.stopFlag.Load() {
+					return
 				}
 
 				if score <= alpha {
-					// Fail low - widen window down
 					alpha = -Infinity
 				} else if score >= beta {
-					// Fail high - widen window up
 					beta = Infinity
 				} else {
-					// Score within window, we're done
 					break
 				}
 
-				// If both bounds are infinite, we've done a full search
 				if alpha == -Infinity && beta == Infinity {
 					break
 				}
 			}
 		} else {
-			// Full window search for early depths
-			move, score = e.searcher.Search(pos, depth)
+			move, score = worker.SearchDepth(depth, -Infinity, Infinity)
 		}
 
-		// Check if search was stopped
-		if e.searcher.stopFlag.Load() {
-			break
+		if e.stopFlag.Load() {
+			return
 		}
 
-		// Update best move
-		if move != board.NoMove {
-			bestMove = move
-			bestScore = score
-		}
+		prevScore = score
 
-		// Report info
-		if e.OnInfo != nil {
-			elapsed := time.Since(startTime)
-			e.OnInfo(SearchInfo{
-				Depth:    depth,
-				Score:    bestScore,
-				Nodes:    e.searcher.Nodes(),
-				Time:     elapsed,
-				PV:       e.searcher.GetPV(),
-				HashFull: e.tt.HashFull(),
-			})
-		}
-
-		// Early termination: found mate
-		if score > MateScore-100 || score < -MateScore+100 {
-			break
-		}
-
-		// Check time after iteration
-		if !deadline.IsZero() {
-			elapsed := time.Since(startTime)
-			remaining := limits.MoveTime - elapsed
-
-			// If we've used more than half the time, don't start another iteration
-			if remaining < elapsed {
-				break
-			}
+		// Send result
+		pv := worker.GetPV()
+		resultCh <- WorkerResult{
+			WorkerID: workerID,
+			Depth:    depth,
+			Score:    score,
+			Move:     move,
+			PV:       pv,
+			Nodes:    worker.Nodes(),
 		}
 	}
+}
 
-	return bestMove
+// getTotalNodes returns the total nodes searched by all workers.
+func (e *Engine) getTotalNodes() uint64 {
+	var total uint64
+	for _, w := range e.workers {
+		total += w.Nodes()
+	}
+	return total
 }
 
 // SearchMultiPV finds multiple best moves (principal variations) for analysis.
@@ -289,7 +415,7 @@ func (e *Engine) SearchMultiPV(pos *board.Position, limits SearchLimits) []Searc
 // searchWithExclusions searches for best move excluding certain moves at the root.
 func (e *Engine) searchWithExclusions(pos *board.Position, limits SearchLimits, excluded []board.Move) (board.Move, int, []board.Move, int) {
 	e.searcher.Reset()
-	e.searcher.excludedRootMoves = excluded
+	e.searcher.SetExcludedMoves(excluded)
 	e.tt.NewSearch()
 
 	startTime := time.Now()
@@ -314,7 +440,7 @@ func (e *Engine) searchWithExclusions(pos *board.Position, limits SearchLimits, 
 
 		move, score := e.searcher.Search(pos, depth)
 
-		if e.searcher.stopFlag.Load() {
+		if e.searcher.IsStopped() {
 			break
 		}
 
@@ -338,20 +464,25 @@ func (e *Engine) searchWithExclusions(pos *board.Position, limits SearchLimits, 
 	}
 
 	pv := e.searcher.GetPV()
-	e.searcher.excludedRootMoves = nil // Clear exclusions
+	e.searcher.SetExcludedMoves(nil) // Clear exclusions
 
 	return bestMove, bestScore, pv, bestDepth
 }
 
 // Stop stops the current search.
 func (e *Engine) Stop() {
+	e.stopFlag.Store(true)
 	e.searcher.Stop()
 }
 
 // Clear clears the transposition table and other caches.
 func (e *Engine) Clear() {
 	e.tt.Clear()
-	e.searcher.orderer.Clear()
+	// Clear all worker orderers
+	for _, w := range e.workers {
+		w.orderer.Clear()
+	}
+	e.searcher.ClearOrderer()
 }
 
 // Perft performs a perft test (for debugging move generation).
@@ -379,6 +510,56 @@ func (e *Engine) Perft(pos *board.Position, depth int) uint64 {
 // Evaluate returns the static evaluation of a position.
 func (e *Engine) Evaluate(pos *board.Position) int {
 	return Evaluate(pos)
+}
+
+// LoadNNUE loads NNUE network files.
+func (e *Engine) LoadNNUE(bigPath, smallPath string) error {
+	log.Printf("[Engine] Loading NNUE networks...")
+	log.Printf("[Engine]   Big network: %s", bigPath)
+	log.Printf("[Engine]   Small network: %s", smallPath)
+
+	nets, err := sfnnue.LoadNetworks(bigPath, smallPath)
+	if err != nil {
+		log.Printf("[Engine] Failed to load NNUE: %v", err)
+		return err
+	}
+	e.nnueNet = nets
+
+	// Initialize NNUE evaluators for all workers
+	for _, w := range e.workers {
+		w.initNNUE(nets)
+	}
+
+	// Initialize for legacy searcher
+	e.searcher.worker.initNNUE(nets)
+
+	log.Printf("[Engine] NNUE networks loaded successfully")
+	return nil
+}
+
+// SetUseNNUE enables or disables NNUE evaluation.
+func (e *Engine) SetUseNNUE(use bool) {
+	e.useNNUE = use
+	for _, w := range e.workers {
+		w.useNNUE = use
+	}
+	e.searcher.worker.useNNUE = use
+
+	if use {
+		log.Printf("[Engine] Evaluation mode: NNUE")
+	} else {
+		log.Printf("[Engine] Evaluation mode: Classical")
+	}
+}
+
+// UseNNUE returns whether NNUE evaluation is enabled.
+func (e *Engine) UseNNUE() bool {
+	return e.useNNUE
+}
+
+// HasNNUE returns whether NNUE networks are loaded.
+func (e *Engine) HasNNUE() bool {
+	return e.nnueNet != nil
 }
 
 // ScoreToString converts a score to a human-readable string.

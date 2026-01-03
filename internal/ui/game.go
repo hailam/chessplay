@@ -178,6 +178,14 @@ func (g *Game) loadPreferences() {
 	case DifficultyHard:
 		g.engine.SetDifficulty(engine.Hard)
 	}
+
+	// Load NNUE networks if eval mode is NNUE and networks exist
+	if g.evalMode == EvalNNUE {
+		smallExists, bigExists, _ := CheckNNUENetworks()
+		if smallExists && bigExists {
+			g.loadNNUENetworks()
+		}
+	}
 }
 
 // savePreferences saves current preferences to storage.
@@ -228,7 +236,7 @@ func (g *Game) checkFirstLaunch() {
 				}
 			}
 
-			g.evalMode = EvalMode(evalMode)
+			g.setEvalMode(EvalMode(evalMode))
 			g.savePreferences()
 		})
 	}
@@ -548,6 +556,11 @@ func (g *Game) findMove(src, dst board.Square) board.Move {
 
 // makeMove applies a move to the game.
 func (g *Game) makeMove(m board.Move) {
+	// Debug logging - before move
+	log.Printf("[MOVE] Before: SideToMove=%v, Move=%v (from=%v to=%v)",
+		g.position.SideToMove, m, m.From(), m.To())
+	log.Printf("[MOVE] Piece at from=%v: %v", m.From(), g.position.PieceAt(m.From()))
+
 	// Determine move properties before making the move
 	isCapture := m.IsCapture(g.position)
 	isCastling := m.IsCastling()
@@ -558,6 +571,9 @@ func (g *Game) makeMove(m board.Move) {
 
 	// Make the move
 	g.position.MakeMove(m)
+
+	// Debug logging - after move
+	log.Printf("[MOVE] After: SideToMove=%v", g.position.SideToMove)
 	g.moveHistory = append(g.moveHistory, m)
 	g.lastMove = m
 
@@ -638,6 +654,14 @@ func (g *Game) isThreefoldRepetition() bool {
 
 // startAIThinking starts the AI search in a goroutine.
 func (g *Game) startAIThinking() {
+	// Assertion: AI should only think when it's Black's turn
+	if g.position.SideToMove != board.Black {
+		log.Printf("ERROR: startAIThinking called but SideToMove is %v (expected Black)!",
+			g.position.SideToMove)
+		return
+	}
+
+	log.Printf("[AI] Starting AI search - SideToMove=%v", g.position.SideToMove)
 	g.aiThinking = true
 
 	// Copy position for the search
@@ -660,9 +684,12 @@ func (g *Game) checkAIMove() {
 
 	select {
 	case move := <-g.aiMove:
+		log.Printf("[AI] Received move from engine: %v (from=%v to=%v)", move, move.From(), move.To())
+		log.Printf("[AI] Current position SideToMove: %v", g.position.SideToMove)
 		g.aiThinking = false
 		if move == board.NoMove {
 			// AI has no valid move - game should be over (checkmate/stalemate)
+			log.Printf("[AI] No valid move - checking game end")
 			g.checkGameEnd()
 			return
 		}
@@ -791,7 +818,7 @@ func (g *Game) ShowSettings() {
 		}
 
 		// Update eval mode (either Classical, or NNUE with files ready)
-		g.evalMode = EvalMode(prefs.EvalMode)
+		g.setEvalMode(EvalMode(prefs.EvalMode))
 		g.savePreferences()
 	}, nil)
 }
@@ -800,15 +827,46 @@ func (g *Game) ShowSettings() {
 func (g *Game) showNNUEDownload() {
 	g.downloader.Show(func() {
 		// Download complete - update eval mode and save
-		g.evalMode = EvalNNUE
+		g.setEvalMode(EvalNNUE)
 		g.savePreferences()
 		log.Printf("NNUE networks downloaded successfully")
 	}, func() {
 		// Download cancelled - revert to classical
-		g.evalMode = EvalClassical
+		g.setEvalMode(EvalClassical)
 		g.prefs.EvalMode = storage.EvalClassical
 		g.savePreferences()
 	})
+}
+
+// loadNNUENetworks loads NNUE network files into the engine.
+func (g *Game) loadNNUENetworks() {
+	smallPath, bigPath, err := GetNNUEPaths()
+	if err != nil {
+		log.Printf("Warning: Failed to get NNUE paths: %v", err)
+		return
+	}
+
+	if err := g.engine.LoadNNUE(bigPath, smallPath); err != nil {
+		log.Printf("Warning: Failed to load NNUE networks: %v", err)
+		return
+	}
+
+	g.engine.SetUseNNUE(true)
+	log.Printf("NNUE networks loaded successfully")
+}
+
+// setEvalMode sets the evaluation mode and updates the engine.
+func (g *Game) setEvalMode(mode EvalMode) {
+	g.evalMode = mode
+	if mode == EvalNNUE {
+		if g.engine.HasNNUE() {
+			g.engine.SetUseNNUE(true)
+		} else {
+			g.loadNNUENetworks()
+		}
+	} else {
+		g.engine.SetUseNNUE(false)
+	}
 }
 
 // Close cleans up game resources.

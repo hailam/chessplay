@@ -21,6 +21,10 @@ type UCI struct {
 	// Position history for repetition detection
 	positionHashes []uint64
 
+	// NNUE configuration
+	nnueBigPath   string
+	nnueSmallPath string
+
 	// Search state
 	searching     bool
 	searchDone    chan struct{}
@@ -81,6 +85,9 @@ func (u *UCI) handleUCI() {
 	fmt.Println("id author ChessPlay Team")
 	fmt.Println()
 	fmt.Println("option name Hash type spin default 64 min 1 max 4096")
+	fmt.Println("option name UseNNUE type check default false")
+	fmt.Println("option name EvalFile type string default <empty>")
+	fmt.Println("option name EvalFileSmall type string default <empty>")
 	fmt.Println("uciok")
 }
 
@@ -494,6 +501,35 @@ func (u *UCI) handleSetOption(args []string) {
 	case "hash":
 		// TODO: Resize hash table
 		// For now, ignore - would need engine support
+	case "usennue":
+		useNNUE := strings.ToLower(value) == "true"
+		if useNNUE && u.nnueBigPath != "" && u.nnueSmallPath != "" {
+			// Load networks if not already loaded
+			if !u.engine.HasNNUE() {
+				if err := u.engine.LoadNNUE(u.nnueBigPath, u.nnueSmallPath); err != nil {
+					fmt.Fprintf(os.Stderr, "info string Failed to load NNUE: %v\n", err)
+					return
+				}
+			}
+		}
+		u.engine.SetUseNNUE(useNNUE)
+	case "evalfile":
+		u.nnueBigPath = value
+		u.tryLoadNNUE()
+	case "evalfilesmall":
+		u.nnueSmallPath = value
+		u.tryLoadNNUE()
+	}
+}
+
+// tryLoadNNUE attempts to load NNUE networks if both paths are set.
+func (u *UCI) tryLoadNNUE() {
+	if u.nnueBigPath != "" && u.nnueSmallPath != "" {
+		if err := u.engine.LoadNNUE(u.nnueBigPath, u.nnueSmallPath); err != nil {
+			fmt.Fprintf(os.Stderr, "info string Failed to load NNUE: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "info string NNUE networks loaded\n")
+		}
 	}
 }
 
