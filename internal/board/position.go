@@ -309,23 +309,22 @@ func (p *Position) ComputePinned() Bitboard {
 	return pinned
 }
 
-// nullMoveUndo stores state for unmake of null move.
-type nullMoveUndo struct {
+// NullMoveUndo stores state for unmake of null move.
+// Returned by MakeNullMove and passed to UnmakeNullMove.
+type NullMoveUndo struct {
 	EnPassant Square
 	Hash      uint64
 }
 
-// nullMoveStack stores null move undo info (simple stack).
-var nullMoveStack []nullMoveUndo
-
 // MakeNullMove makes a null move (passes the turn without moving).
 // Used for null move pruning in search.
-func (p *Position) MakeNullMove() {
+// Returns undo info that must be passed to UnmakeNullMove.
+func (p *Position) MakeNullMove() NullMoveUndo {
 	// Save state for unmake
-	nullMoveStack = append(nullMoveStack, nullMoveUndo{
+	undo := NullMoveUndo{
 		EnPassant: p.EnPassant,
 		Hash:      p.Hash,
-	})
+	}
 
 	// Update hash for en passant removal
 	if p.EnPassant != NoSquare {
@@ -341,18 +340,12 @@ func (p *Position) MakeNullMove() {
 
 	// Update checkers for new side
 	p.UpdateCheckers()
+
+	return undo
 }
 
 // UnmakeNullMove undoes a null move.
-func (p *Position) UnmakeNullMove() {
-	// Pop from stack
-	n := len(nullMoveStack)
-	if n == 0 {
-		return
-	}
-	undo := nullMoveStack[n-1]
-	nullMoveStack = nullMoveStack[:n-1]
-
+func (p *Position) UnmakeNullMove(undo NullMoveUndo) {
 	// Restore state
 	p.EnPassant = undo.EnPassant
 	p.Hash = undo.Hash

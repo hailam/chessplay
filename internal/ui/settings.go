@@ -27,7 +27,8 @@ var (
 
 // SettingsModal is the settings configuration screen.
 type SettingsModal struct {
-	visible bool
+	visible      bool
+	needsCapture bool // Set true when opening to capture background
 
 	// Position (centered on screen)
 	x, y int
@@ -106,6 +107,7 @@ func (sm *SettingsModal) createWidgets() {
 // Show displays the settings modal with the given preferences.
 func (sm *SettingsModal) Show(prefs *storage.UserPreferences, onSave func(*storage.UserPreferences), onCancel func()) {
 	sm.visible = true
+	sm.needsCapture = true // Capture background on first draw
 	sm.onSave = onSave
 	sm.onCancel = onCancel
 
@@ -213,11 +215,15 @@ func (sm *SettingsModal) Draw(screen *ebiten.Image, glass *GlassEffect) {
 		return
 	}
 
-	// Full-screen blur overlay with glass effect
+	// Capture background once when modal first opens (fixes flicker)
+	if sm.needsCapture && glass != nil && glass.IsEnabled() {
+		glass.CaptureForModal(screen, 3.0) // sigma=3.0 blur
+		sm.needsCapture = false
+	}
+
+	// Draw blurred, dimmed background (simple blur + dim, NOT glass material)
 	if glass != nil && glass.IsEnabled() {
-		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
-		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
-			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+		glass.DrawModalBackground(screen, 0.4) // 40% dimming
 	} else {
 		// Fallback: semi-transparent overlay
 		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)

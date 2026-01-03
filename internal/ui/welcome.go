@@ -19,7 +19,8 @@ const (
 
 // WelcomeScreen is shown on first launch.
 type WelcomeScreen struct {
-	visible bool
+	visible      bool
+	needsCapture bool // Set true when opening to capture background
 
 	// Position (centered on screen)
 	x, y int
@@ -74,6 +75,7 @@ func (ws *WelcomeScreen) createWidgets() {
 // Show displays the welcome screen.
 func (ws *WelcomeScreen) Show(onComplete func(name string, evalMode storage.EvalMode)) {
 	ws.visible = true
+	ws.needsCapture = true // Capture background on first draw
 	ws.onComplete = onComplete
 	ws.nameInput.Value = ""
 	ws.evalModeRadio.Selected = 0
@@ -140,11 +142,15 @@ func (ws *WelcomeScreen) Draw(screen *ebiten.Image, glass *GlassEffect) {
 		return
 	}
 
-	// Full-screen blur overlay with glass effect
+	// Capture background once when modal first opens (fixes flicker)
+	if ws.needsCapture && glass != nil && glass.IsEnabled() {
+		glass.CaptureForModal(screen, 3.0) // sigma=3.0 blur
+		ws.needsCapture = false
+	}
+
+	// Draw blurred, dimmed background (simple blur + dim, NOT glass material)
 	if glass != nil && glass.IsEnabled() {
-		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
-		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
-			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+		glass.DrawModalBackground(screen, 0.4) // 40% dimming
 	} else {
 		// Fallback: semi-transparent overlay
 		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)

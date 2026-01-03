@@ -361,9 +361,9 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			R = depth - 1
 		}
 
-		w.pos.MakeNullMove()
+		nullUndo := w.pos.MakeNullMove()
 		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove)
-		w.pos.UnmakeNullMove()
+		w.pos.UnmakeNullMove(nullUndo)
 
 		if nullScore >= beta {
 			return beta

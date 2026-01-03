@@ -59,6 +59,21 @@ func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
 }
 `)
 
+// Kage shader for simple dimming (modal backgrounds)
+var dimmingShader = []byte(`
+//kage:unit pixels
+
+package main
+
+var DimAmount float
+
+func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
+    bg := imageSrc0At(srcPos)
+    // Apply dimming by darkening the blurred background
+    return vec4(bg.rgb * (1.0 - DimAmount), 1.0)
+}
+`)
+
 // Kage shader for liquid glass with SDF, fresnel, chromatic aberration
 var liquidGlassShader = []byte(`
 //kage:unit pixels
@@ -154,10 +169,16 @@ type GlassEffect struct {
 	blurH   *ebiten.Shader
 	blurV   *ebiten.Shader
 	glass   *ebiten.Shader
-	tempH   *ebiten.Image // Horizontal blur result
-	tempV   *ebiten.Image // Vertical blur result
+	dimming *ebiten.Shader // For modal backgrounds
+	tempH   *ebiten.Image  // Horizontal blur result
+	tempV   *ebiten.Image  // Vertical blur result
 	time    float64
 	enabled bool
+
+	// Cached modal background (captured once when modal opens)
+	modalCache *ebiten.Image
+	modalW     int
+	modalH     int
 }
 
 // NewGlassEffect creates a new glass effect manager
@@ -180,6 +201,12 @@ func NewGlassEffect() *GlassEffect {
 	}
 
 	ge.glass, err = ebiten.NewShader(liquidGlassShader)
+	if err != nil {
+		ge.enabled = false
+		return ge
+	}
+
+	ge.dimming, err = ebiten.NewShader(dimmingShader)
 	if err != nil {
 		ge.enabled = false
 		return ge
@@ -297,4 +324,94 @@ func (ge *GlassEffect) DrawGlassSimple(screen *ebiten.Image, x, y, w, h int, tin
 // DrawGlassRect draws glass effect using a rectangle (for convenience with image.Rectangle)
 func (ge *GlassEffect) DrawGlassRect(screen *ebiten.Image, rect image.Rectangle, tint color.RGBA, sigma float64) {
 	ge.DrawGlassSimple(screen, rect.Min.X, rect.Min.Y, rect.Dx(), rect.Dy(), tint, sigma)
+}
+
+// CaptureForModal captures and blurs the current screen for modal use.
+// Call this ONCE when modal opens, not every frame, to avoid flicker.
+func (ge *GlassEffect) CaptureForModal(screen *ebiten.Image, sigma float64) {
+	if !ge.IsEnabled() {
+		return
+	}
+
+	bounds := screen.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	// Ensure cache image exists and is correct size
+	if ge.modalCache == nil || ge.modalW != w || ge.modalH != h {
+		ge.modalCache = ebiten.NewImage(w, h)
+		ge.modalW = w
+		ge.modalH = h
+	}
+
+	// Ensure temp images are correct size
+	ge.ensureImages(w, h)
+
+	// Capture screen to tempH
+	ge.tempH.Clear()
+	op := &ebiten.DrawImageOptions{}
+	ge.tempH.DrawImage(screen, op)
+
+	// Apply horizontal blur: tempH -> tempV
+	ge.tempV.Clear()
+	blurOpH := &ebiten.DrawRectShaderOptions{
+		Uniforms: map[string]interface{}{
+			"Sigma": float32(sigma),
+		},
+		Images: [4]*ebiten.Image{ge.tempH},
+	}
+	ge.tempV.DrawRectShader(w, h, ge.blurH, blurOpH)
+
+	// Apply vertical blur: tempV -> modalCache
+	ge.modalCache.Clear()
+	blurOpV := &ebiten.DrawRectShaderOptions{
+		Uniforms: map[string]interface{}{
+			"Sigma": float32(sigma),
+		},
+		Images: [4]*ebiten.Image{ge.tempV},
+	}
+	ge.modalCache.DrawRectShader(w, h, ge.blurV, blurOpV)
+}
+
+// DrawModalBackground draws the cached blurred background with dimming.
+// Use this for modal backgrounds - NOT for material surfaces.
+func (ge *GlassEffect) DrawModalBackground(screen *ebiten.Image, dimAmount float64) {
+	if !ge.IsEnabled() || ge.modalCache == nil {
+		// Fallback: simple dark overlay
+		ge.drawModalFallback(screen, dimAmount)
+		return
+	}
+
+	bounds := screen.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+
+	// Apply dimming shader to cached blur and draw to screen
+	dimOp := &ebiten.DrawRectShaderOptions{
+		Uniforms: map[string]interface{}{
+			"DimAmount": float32(dimAmount),
+		},
+		Images: [4]*ebiten.Image{ge.modalCache},
+	}
+	screen.DrawRectShader(w, h, ge.dimming, dimOp)
+}
+
+// drawModalFallback draws a simple semi-transparent dark overlay
+func (ge *GlassEffect) drawModalFallback(screen *ebiten.Image, dimAmount float64) {
+	bounds := screen.Bounds()
+	alpha := uint8(dimAmount * 255)
+	overlay := color.RGBA{0, 0, 0, alpha}
+
+	fallbackImg := ebiten.NewImage(bounds.Dx(), bounds.Dy())
+	fallbackImg.Fill(overlay)
+	screen.DrawImage(fallbackImg, nil)
+}
+
+// InvalidateModalCache clears the modal cache (call when modal closes)
+func (ge *GlassEffect) InvalidateModalCache() {
+	if ge.modalCache != nil {
+		ge.modalCache.Clear()
+	}
 }

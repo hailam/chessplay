@@ -57,9 +57,10 @@ type DownloadProgress struct {
 
 // Downloader manages NNUE network file downloads.
 type Downloader struct {
-	visible  bool
-	progress DownloadProgress
-	mu       sync.RWMutex
+	visible      bool
+	needsCapture bool // Set true when opening to capture background
+	progress     DownloadProgress
+	mu           sync.RWMutex
 
 	// Position (centered)
 	x, y int
@@ -93,6 +94,7 @@ func (d *Downloader) IsVisible() bool {
 // Show displays the downloader and starts downloading.
 func (d *Downloader) Show(onComplete func(), onCancel func()) {
 	d.visible = true
+	d.needsCapture = true // Capture background on first draw
 	d.onComplete = onComplete
 	d.onCancel = onCancel
 	d.cancelCh = make(chan struct{})
@@ -289,11 +291,15 @@ func (d *Downloader) Draw(screen *ebiten.Image, glass *GlassEffect) {
 		return
 	}
 
-	// Full-screen blur overlay with glass effect
+	// Capture background once when modal first opens (fixes flicker)
+	if d.needsCapture && glass != nil && glass.IsEnabled() {
+		glass.CaptureForModal(screen, 3.0) // sigma=3.0 blur
+		d.needsCapture = false
+	}
+
+	// Draw blurred, dimmed background (simple blur + dim, NOT glass material)
 	if glass != nil && glass.IsEnabled() {
-		tint := color.RGBA{0, 0, 0, 100} // Dark tint for modal backdrop
-		glass.DrawGlass(screen, 0, 0, scaleI(ScreenWidth), scaleI(ScreenHeight),
-			tint, 3.0, 4.0) // sigma=3.0, refraction=4.0
+		glass.DrawModalBackground(screen, 0.4) // 40% dimming
 	} else {
 		// Fallback: semi-transparent overlay
 		vector.DrawFilledRect(screen, 0, 0, scaleF(ScreenWidth), scaleF(ScreenHeight), modalOverlay, false)
