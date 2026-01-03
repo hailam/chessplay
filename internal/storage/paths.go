@@ -2,6 +2,7 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -85,6 +86,8 @@ func GetDatabaseDir() (string, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return "", err
 	}
+
+	fmt.Printf("Database directory: %s\n", dbDir)
 
 	return dbDir, nil
 }
