@@ -226,24 +226,22 @@ func (ft *FeatureTransformer) ComputeAccumulator(
 	accumulation []int16,
 	psqtAccumulation []int32,
 ) {
-	// Start with biases
-	copy(accumulation, ft.Biases)
+	// Start with biases (SIMD accelerated)
+	SIMDCopyInt16(accumulation, ft.Biases)
 
 	// Initialize PSQT to zero
 	for i := range psqtAccumulation {
 		psqtAccumulation[i] = 0
 	}
 
-	// Add weights for active features
+	// Add weights for active features (SIMD accelerated)
 	for _, idx := range activeIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
-			// Add feature weights
+			// Add feature weights using SIMD
 			offset := idx * ft.HalfDimensions
-			for i := 0; i < ft.HalfDimensions; i++ {
-				accumulation[i] += ft.Weights[offset+i]
-			}
+			SIMDAddInt16Offset(accumulation, ft.Weights, offset, ft.HalfDimensions)
 
-			// Add PSQT weights
+			// Add PSQT weights (small loop, not worth SIMD)
 			psqtOffset := idx * PSQTBuckets
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] += ft.PSQTWeights[psqtOffset+b]
@@ -253,19 +251,19 @@ func (ft *FeatureTransformer) ComputeAccumulator(
 }
 
 // UpdateAccumulator incrementally updates the accumulator (in-place).
+// Uses SIMD for the hot int16 loops.
 func (ft *FeatureTransformer) UpdateAccumulator(
 	removedIndices, addedIndices []int,
 	accumulation []int16,
 	psqtAccumulation []int32,
 ) {
-	// Remove old features
+	// Remove old features (SIMD accelerated)
 	for _, idx := range removedIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
 			offset := idx * ft.HalfDimensions
-			for i := 0; i < ft.HalfDimensions; i++ {
-				accumulation[i] -= ft.Weights[offset+i]
-			}
+			SIMDSubInt16Offset(accumulation, ft.Weights, offset, ft.HalfDimensions)
 
+			// PSQT is only 8 elements, not worth SIMD
 			psqtOffset := idx * PSQTBuckets
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] -= ft.PSQTWeights[psqtOffset+b]
@@ -273,14 +271,13 @@ func (ft *FeatureTransformer) UpdateAccumulator(
 		}
 	}
 
-	// Add new features
+	// Add new features (SIMD accelerated)
 	for _, idx := range addedIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
 			offset := idx * ft.HalfDimensions
-			for i := 0; i < ft.HalfDimensions; i++ {
-				accumulation[i] += ft.Weights[offset+i]
-			}
+			SIMDAddInt16Offset(accumulation, ft.Weights, offset, ft.HalfDimensions)
 
+			// PSQT is only 8 elements, not worth SIMD
 			psqtOffset := idx * PSQTBuckets
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] += ft.PSQTWeights[psqtOffset+b]
@@ -298,8 +295,8 @@ func (ft *FeatureTransformer) ForwardUpdateIncremental(
 	removedIndices, addedIndices []int,
 	perspective int,
 ) {
-	// Copy previous accumulation to current
-	copy(currAcc.Accumulation[perspective], prevAcc.Accumulation[perspective])
+	// Copy previous accumulation to current (SIMD accelerated)
+	SIMDCopyInt16(currAcc.Accumulation[perspective], prevAcc.Accumulation[perspective])
 	copy(currAcc.PSQTAccumulation[perspective], prevAcc.PSQTAccumulation[perspective])
 
 	// Apply changes
@@ -323,8 +320,8 @@ func (ft *FeatureTransformer) BackwardUpdateIncremental(
 	removedIndices, addedIndices []int,
 	perspective int,
 ) {
-	// Copy later accumulation to current
-	copy(currAcc.Accumulation[perspective], laterAcc.Accumulation[perspective])
+	// Copy later accumulation to current (SIMD accelerated)
+	SIMDCopyInt16(currAcc.Accumulation[perspective], laterAcc.Accumulation[perspective])
 	copy(currAcc.PSQTAccumulation[perspective], laterAcc.PSQTAccumulation[perspective])
 
 	// Reverse the changes: what was removed gets added back, what was added gets removed

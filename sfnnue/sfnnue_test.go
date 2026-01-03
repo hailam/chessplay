@@ -298,3 +298,92 @@ func TestAccumulatorStack(t *testing.T) {
 
 	t.Log("Accumulator stack operations work correctly")
 }
+
+// Benchmarks for SIMD operations
+
+// BenchmarkSIMDAddInt16 benchmarks int16 vector addition
+func BenchmarkSIMDAddInt16(b *testing.B) {
+	// Test with big network accumulator size (1024)
+	dst := make([]int16, 1024)
+	src := make([]int16, 1024)
+	for i := range src {
+		src[i] = int16(i % 256)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		SIMDAddInt16(dst, src)
+	}
+}
+
+// BenchmarkSIMDCopyInt16 benchmarks int16 vector copy
+func BenchmarkSIMDCopyInt16(b *testing.B) {
+	dst := make([]int16, 1024)
+	src := make([]int16, 1024)
+	for i := range src {
+		src[i] = int16(i % 256)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		SIMDCopyInt16(dst, src)
+	}
+}
+
+// BenchmarkAccumulatorUpdate benchmarks incremental accumulator updates
+func BenchmarkAccumulatorUpdate(b *testing.B) {
+	halfDims := TransformedFeatureDimensionsBig // 1024
+	inputDims := 1000
+	ft := &FeatureTransformer{
+		HalfDimensions:  halfDims,
+		InputDimensions: inputDims,
+		UseThreats:      false,
+		Biases:          make([]int16, halfDims),
+		Weights:         make([]int16, halfDims*inputDims),
+		PSQTWeights:     make([]int32, inputDims*PSQTBuckets),
+	}
+
+	for i := range ft.Weights {
+		ft.Weights[i] = int16((i * 7) % 200)
+	}
+
+	acc := make([]int16, halfDims)
+	psqt := make([]int32, PSQTBuckets)
+	removed := []int{50, 100}
+	added := []int{300, 400}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ft.UpdateAccumulator(removed, added, acc, psqt)
+	}
+}
+
+// BenchmarkAccumulatorCompute benchmarks full accumulator computation
+func BenchmarkAccumulatorCompute(b *testing.B) {
+	halfDims := TransformedFeatureDimensionsBig // 1024
+	inputDims := 1000
+	ft := &FeatureTransformer{
+		HalfDimensions:  halfDims,
+		InputDimensions: inputDims,
+		UseThreats:      false,
+		Biases:          make([]int16, halfDims),
+		Weights:         make([]int16, halfDims*inputDims),
+		PSQTWeights:     make([]int32, inputDims*PSQTBuckets),
+	}
+
+	for i := range ft.Biases {
+		ft.Biases[i] = int16(i % 100)
+	}
+	for i := range ft.Weights {
+		ft.Weights[i] = int16((i * 7) % 200)
+	}
+
+	acc := make([]int16, halfDims)
+	psqt := make([]int32, PSQTBuckets)
+	features := []int{10, 50, 100, 200, 500, 600, 700, 800} // Typical 8 active features
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ft.ComputeAccumulator(features, acc, psqt)
+	}
+}

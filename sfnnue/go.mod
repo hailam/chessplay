@@ -1,3 +1,3 @@
 module github.com/hailam/chessplay/sfnnue
 
-go 1.25
+go 1.26rc1

@@ -17,7 +17,8 @@ const (
 )
 
 // Number of shards for TT locking (power of 2 for fast modulo)
-const ttShardCount = 256
+// 1024 shards reduces lock contention on high-core systems
+const ttShardCount = 1024
 const ttShardMask = ttShardCount - 1
 
 // TTEntry represents an entry in the transposition table.

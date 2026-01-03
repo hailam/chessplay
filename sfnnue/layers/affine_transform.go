@@ -86,18 +86,11 @@ func (a *AffineTransform) getWeightIndex(i int) int {
 // Propagate performs the forward pass: output = weights * input + bias
 // Input: uint8 slice, Output: int32 slice
 // Ported from affine_transform.h:194-299
+// Uses SIMD-accelerated dot product when available.
 func (a *AffineTransform) Propagate(input []uint8, output []int32) {
-	// Copy biases to output
-	copy(output, a.Biases)
-
-	// Matrix multiplication (simplified non-SIMD version)
-	// For SIMD, Stockfish processes in chunks of 4
+	// Matrix multiplication with SIMD-accelerated dot product
 	for i := 0; i < a.OutputDimensions; i++ {
-		sum := a.Biases[i]
 		offset := i * a.PaddedInputDimensions
-		for j := 0; j < a.InputDimensions; j++ {
-			sum += int32(a.Weights[offset+j]) * int32(input[j])
-		}
-		output[i] = sum
+		output[i] = a.Biases[i] + SIMDDotProductInt8Uint8(a.Weights[offset:], input, a.InputDimensions)
 	}
 }

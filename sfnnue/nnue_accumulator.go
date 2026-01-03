@@ -52,10 +52,10 @@ func (a *Accumulator) Reset() {
 	a.NeedsRefresh[1] = true
 }
 
-// Copy copies values from another accumulator
+// Copy copies values from another accumulator (SIMD accelerated)
 func (a *Accumulator) Copy(other *Accumulator) {
-	copy(a.Accumulation[0], other.Accumulation[0])
-	copy(a.Accumulation[1], other.Accumulation[1])
+	SIMDCopyInt16(a.Accumulation[0], other.Accumulation[0])
+	SIMDCopyInt16(a.Accumulation[1], other.Accumulation[1])
 	copy(a.PSQTAccumulation[0], other.PSQTAccumulation[0])
 	copy(a.PSQTAccumulation[1], other.PSQTAccumulation[1])
 	a.Computed[0] = other.Computed[0]
@@ -203,12 +203,12 @@ func NewAccumulatorCache(halfDims int, biases []int16) *AccumulatorCache {
 	return cache
 }
 
-// Clear resets the cache with the given biases
+// Clear resets the cache with the given biases (SIMD accelerated)
 func (c *AccumulatorCache) Clear(biases []int16) {
 	for sq := 0; sq < 64; sq++ {
 		for color := 0; color < 2; color++ {
 			entry := &c.Entries[sq][color]
-			copy(entry.Accumulation, biases)
+			SIMDCopyInt16(entry.Accumulation, biases)
 			for i := range entry.PSQTAccumulation {
 				entry.PSQTAccumulation[i] = 0
 			}
@@ -256,8 +256,8 @@ func (c *AccumulatorCache) UpdateFromCache(
 		return changedCount
 	}
 
-	// Copy from cache
-	copy(acc.Accumulation[perspective], entry.Accumulation)
+	// Copy from cache (SIMD accelerated)
+	SIMDCopyInt16(acc.Accumulation[perspective], entry.Accumulation)
 	copy(acc.PSQTAccumulation[perspective], entry.PSQTAccumulation)
 
 	// Apply changes
@@ -335,7 +335,7 @@ func (c *AccumulatorCache) UpdateFromCache(
 	return changedCount
 }
 
-// SaveToCache saves the current accumulator state to the cache entry
+// SaveToCache saves the current accumulator state to the cache entry (SIMD accelerated)
 func (c *AccumulatorCache) SaveToCache(
 	entry *AccumulatorCacheEntry,
 	acc *Accumulator,
@@ -343,7 +343,7 @@ func (c *AccumulatorCache) SaveToCache(
 	currentPieces [64]int,
 	perspective int,
 ) {
-	copy(entry.Accumulation, acc.Accumulation[perspective])
+	SIMDCopyInt16(entry.Accumulation, acc.Accumulation[perspective])
 	copy(entry.PSQTAccumulation, acc.PSQTAccumulation[perspective])
 	entry.PieceBB = currentPieceBB
 	copy(entry.Pieces[:], currentPieces[:])
