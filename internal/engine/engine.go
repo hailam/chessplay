@@ -16,7 +16,7 @@ import (
 // NumWorkers is the number of parallel search workers.
 // Set to 1 for stability - there's a TT corruption bug in multi-threaded mode.
 // TODO: Debug multi-threaded TT corruption.
-var NumWorkers = 1
+var NumWorkers = runtime.GOMAXPROCS(0)
 
 // SearchInfo contains information about the current search.
 type SearchInfo struct {

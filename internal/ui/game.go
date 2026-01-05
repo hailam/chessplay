@@ -703,10 +703,17 @@ func (g *Game) isThreefoldRepetition() bool {
 
 	currentHash := g.position.Hash
 	count := 0
-	for _, h := range g.positionHashes {
+	matchIndices := []int{}
+
+	for i, h := range g.positionHashes {
 		if h == currentHash {
 			count++
+			matchIndices = append(matchIndices, i)
 			if count >= 3 {
+				// Debug logging to diagnose false positives
+				log.Printf("[THREEFOLD] Detected! Hash=%x Count=%d MatchIndices=%v TotalPositions=%d",
+					currentHash, count, matchIndices, len(g.positionHashes))
+				log.Printf("[THREEFOLD] Current FEN: %s", g.position.ToFEN())
 				return true
 			}
 		}

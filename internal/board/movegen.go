@@ -557,6 +557,7 @@ func (p *Position) isLegalEnPassant(m Move) bool {
 
 	undo := p.MakeMove(m)
 	if !undo.Valid {
+		p.UnmakeMove(m, undo) // Must restore position even for invalid moves
 		return false
 	}
 
