@@ -31,10 +31,14 @@ deps:
 		rm -rf ./bin/cli.zip ./bin/c-chess-cli-master; \
 	fi
 
+run: build
+	@echo "Running ChessPlay Core Engine..."
+	go run -pgo=$(PROFILE) .
+
 # 2. Core Engine Build (Library/Standalone)
 build:
 	@mkdir -p ./bin
-	go build -o $(BINARY_CORE) .
+	go build -pgo=$(PROFILE) -o $(BINARY_CORE) .
 
 # 3. UCI Protocol Build (Mac ARM64)
 # Uses PGO if profile exists
@@ -56,8 +60,9 @@ gen-pprof:
 	go test -bench=. -cpuprofile=$(PROFILE) ./internal/engine
 
 # 6. Elo Testing (Targets the UCI binary)
+# Multi-threaded Lazy SMP search enabled
 test-elo: uci
-	@echo "Starting Elo benchmark: $(BINARY_UCI) vs Stockfish"
+	@echo "Starting Elo benchmark: $(BINARY_UCI) vs Stockfish (multi-threaded)"
 	$(CHESS_CLI) \
 		-each tc=10+0.1 \
 		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go \

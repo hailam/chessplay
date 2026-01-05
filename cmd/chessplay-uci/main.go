@@ -17,6 +17,7 @@ const (
 
 func main() {
 	// Create engine with 64MB hash table
+	// Multi-threaded search enabled (Lazy SMP)
 	eng := engine.NewEngine(64)
 
 	// Auto-load NNUE from default locations

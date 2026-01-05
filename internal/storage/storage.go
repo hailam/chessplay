@@ -39,14 +39,23 @@ const (
 	DifficultyHard
 )
 
+// PlayerColor represents which color the human plays
+type PlayerColor int
+
+const (
+	ColorWhite PlayerColor = iota
+	ColorBlack
+)
+
 // UserPreferences stores user settings
 type UserPreferences struct {
-	Username     string     `json:"username"`
-	Difficulty   Difficulty `json:"difficulty"`
-	GameMode     GameMode   `json:"game_mode"`
-	EvalMode     EvalMode   `json:"eval_mode"`
-	SoundEnabled bool       `json:"sound_enabled"`
-	LastPlayed   time.Time  `json:"last_played"`
+	Username     string      `json:"username"`
+	Difficulty   Difficulty  `json:"difficulty"`
+	GameMode     GameMode    `json:"game_mode"`
+	EvalMode     EvalMode    `json:"eval_mode"`
+	PlayerColor  PlayerColor `json:"player_color"`
+	SoundEnabled bool        `json:"sound_enabled"`
+	LastPlayed   time.Time   `json:"last_played"`
 }
 
 // DefaultPreferences returns default user preferences
@@ -56,6 +65,7 @@ func DefaultPreferences() *UserPreferences {
 		Difficulty:   DifficultyMedium,
 		GameMode:     ModeHumanVsComputer,
 		EvalMode:     EvalClassical,
+		PlayerColor:  ColorWhite,
 		SoundEnabled: true,
 		LastPlayed:   time.Now(),
 	}

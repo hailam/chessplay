@@ -12,7 +12,7 @@ import (
 // Settings modal dimensions
 const (
 	SettingsWidth  = 380
-	SettingsHeight = 480
+	SettingsHeight = 540 // Increased for player color option
 	SettingsPadX   = 24
 	SettingsPadY   = 20
 )
@@ -34,12 +34,13 @@ type SettingsModal struct {
 	x, y int
 
 	// Widgets
-	usernameInput  *TextInput
-	evalModeRadio  *RadioGroup
-	difficultyBtns *ButtonGroup
-	soundCheckbox  *Checkbox
-	saveBtn        *ModalButton
-	cancelBtn      *ModalButton
+	usernameInput    *TextInput
+	evalModeRadio    *RadioGroup
+	playerColorRadio *RadioGroup
+	difficultyBtns   *ButtonGroup
+	soundCheckbox    *Checkbox
+	saveBtn          *ModalButton
+	cancelBtn        *ModalButton
 
 	// Callbacks
 	onSave   func(prefs *storage.UserPreferences)
@@ -72,8 +73,15 @@ func (sm *SettingsModal) createWidgets() {
 	inputY := sm.y + 60
 	sm.usernameInput = NewTextInput(contentX, inputY, contentW, 36, "Enter your name", 20)
 
+	// Player color radio group
+	colorY := inputY + 70
+	sm.playerColorRadio = NewRadioGroup(contentX, colorY, []RadioOption{
+		{Label: "White (move first)", Value: int(storage.ColorWhite)},
+		{Label: "Black (move second)", Value: int(storage.ColorBlack)},
+	}, 0)
+
 	// Eval mode radio group
-	radioY := inputY + 70
+	radioY := colorY + 70
 	sm.evalModeRadio = NewRadioGroup(contentX, radioY, []RadioOption{
 		{Label: "Classical Evaluation", Value: int(storage.EvalClassical)},
 		{Label: "NNUE (Neural Network)", Value: int(storage.EvalNNUE)},
@@ -116,11 +124,13 @@ func (sm *SettingsModal) Show(prefs *storage.UserPreferences, onSave func(*stora
 		Username:     prefs.Username,
 		Difficulty:   prefs.Difficulty,
 		EvalMode:     prefs.EvalMode,
+		PlayerColor:  prefs.PlayerColor,
 		SoundEnabled: prefs.SoundEnabled,
 	}
 
 	// Load current values into widgets
 	sm.usernameInput.Value = prefs.Username
+	sm.playerColorRadio.Selected = int(prefs.PlayerColor)
 	sm.evalModeRadio.Selected = int(prefs.EvalMode)
 	sm.difficultyBtns.Selected = int(prefs.Difficulty)
 	sm.soundCheckbox.Checked = prefs.SoundEnabled
@@ -147,6 +157,7 @@ func (sm *SettingsModal) handleSave() {
 		Username:     sm.usernameInput.Value,
 		Difficulty:   storage.Difficulty(sm.difficultyBtns.Selected),
 		EvalMode:     storage.EvalMode(sm.evalModeRadio.Selected),
+		PlayerColor:  storage.PlayerColor(sm.playerColorRadio.Selected),
 		SoundEnabled: sm.soundCheckbox.Checked,
 	}
 
@@ -189,6 +200,7 @@ func (sm *SettingsModal) Update(input *InputHandler) bool {
 
 	// Update widgets
 	sm.usernameInput.Update(input)
+	sm.playerColorRadio.Update(input)
 	sm.evalModeRadio.Update(input)
 	sm.difficultyBtns.Update(input)
 	sm.soundCheckbox.Update(input)
@@ -205,8 +217,8 @@ func (sm *SettingsModal) AnyButtonHovered() bool {
 		return false
 	}
 	return sm.saveBtn.IsHovered() || sm.cancelBtn.IsHovered() ||
-		sm.evalModeRadio.hovered >= 0 || sm.difficultyBtns.hovered >= 0 ||
-		sm.soundCheckbox.hovered
+		sm.playerColorRadio.hovered >= 0 || sm.evalModeRadio.hovered >= 0 ||
+		sm.difficultyBtns.hovered >= 0 || sm.soundCheckbox.hovered
 }
 
 // Draw renders the settings modal.
@@ -244,12 +256,14 @@ func (sm *SettingsModal) Draw(screen *ebiten.Image, glass *GlassEffect) {
 	// Section labels
 	contentX := sm.x + SettingsPadX
 	sm.drawSectionLabel(screen, "Player Name", contentX, sm.y+52)
-	sm.drawSectionLabel(screen, "Engine Mode", contentX, sm.usernameInput.Y+sm.usernameInput.H+16)
+	sm.drawSectionLabel(screen, "Play As", contentX, sm.usernameInput.Y+sm.usernameInput.H+16)
+	sm.drawSectionLabel(screen, "Engine Mode", contentX, sm.playerColorRadio.Y+sm.playerColorRadio.ItemH*len(sm.playerColorRadio.Options)+8)
 	sm.drawSectionLabel(screen, "Difficulty", contentX, sm.evalModeRadio.Y+sm.evalModeRadio.ItemH*len(sm.evalModeRadio.Options)+8)
 	sm.drawSectionLabel(screen, "Audio", contentX, sm.difficultyBtns.Y+sm.difficultyBtns.ButtonH+16)
 
 	// Draw widgets
 	sm.usernameInput.Draw(screen)
+	sm.playerColorRadio.Draw(screen)
 	sm.evalModeRadio.Draw(screen)
 	sm.difficultyBtns.Draw(screen)
 	sm.soundCheckbox.Draw(screen)

@@ -73,14 +73,14 @@ func (tm *TimeManager) Init(limits UCILimits, us board.Color, ply int) {
 	// Add most of the increment
 	baseTime += inc * 9 / 10
 
-	// Stockfish-like scaling based on game phase
-	// Early moves get less time, critical mid-game gets more
-	optScale := 0.02 + float64(ply)/116.4
-	if optScale > 0.25 {
-		optScale = 0.25
-	}
+	// Use baseTime directly as the optimum
+	// No aggressive scaling - we need time to search!
+	tm.optimumTime = baseTime
 
-	tm.optimumTime = time.Duration(float64(baseTime) * optScale)
+	// Slight reduction for very early moves (give some buffer)
+	if ply < 8 {
+		tm.optimumTime = baseTime * 85 / 100
+	}
 
 	// Maximum time: 5x optimum or 80% of remaining, whichever is smaller
 	maxFromOptimum := tm.optimumTime * 5

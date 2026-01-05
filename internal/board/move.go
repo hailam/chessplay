@@ -227,5 +227,9 @@ type UndoInfo struct {
 	Hash           uint64
 	PawnKey        uint64
 	Checkers       Bitboard
-	Valid          bool // True if move was actually applied
+	KingSquare     [2]Square     // King positions before move
+	Pieces         [2][6]Bitboard // Full piece bitboards for reliable restoration
+	Occupied       [2]Bitboard   // Occupancy bitboards
+	AllOccupied    Bitboard      // All pieces
+	Valid          bool          // True if move was actually applied
 }

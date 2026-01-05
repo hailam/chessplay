@@ -13,8 +13,10 @@ import (
 	"github.com/hailam/chessplay/sfnnue"
 )
 
-// NumWorkers is the number of parallel search workers (matches CPU cores).
-var NumWorkers = runtime.GOMAXPROCS(0)
+// NumWorkers is the number of parallel search workers.
+// Set to 1 for stability - there's a TT corruption bug in multi-threaded mode.
+// TODO: Debug multi-threaded TT corruption.
+var NumWorkers = 1
 
 // SearchInfo contains information about the current search.
 type SearchInfo struct {
@@ -55,8 +57,8 @@ const (
 // DifficultySettings maps difficulty to search limits.
 var DifficultySettings = map[Difficulty]SearchLimits{
 	Easy:   {Depth: 3, MoveTime: 500 * time.Millisecond},
-	Medium: {Depth: 7, MoveTime: 1 * time.Second},
-	Hard:   {Depth: 40, MoveTime: 3 * time.Second}, // Max strength (time-limited)
+	Medium: {Depth: 7, MoveTime: 2 * time.Second},
+	Hard:   {Depth: 70, MoveTime: 7 * time.Second},
 }
 
 // Engine is the chess AI engine.
@@ -82,8 +84,19 @@ type Engine struct {
 	useNNUE bool
 	nnueNet *sfnnue.Networks // Shared networks (immutable after load)
 
+	// Debug mode
+	debug bool
+
 	// Callbacks
 	OnInfo func(SearchInfo)
+}
+
+// SetDebug enables or disables debug logging in the engine.
+func (e *Engine) SetDebug(enabled bool) {
+	e.debug = enabled
+	for _, w := range e.workers {
+		w.debug = enabled
+	}
 }
 
 // NewEngine creates a new chess engine with the given transposition table size in MB.
@@ -238,16 +251,25 @@ func (e *Engine) SearchWithLimits(pos *board.Position, limits SearchLimits) boar
 	var deadline time.Time
 	if limits.MoveTime > 0 {
 		deadline = startTime.Add(limits.MoveTime)
+
+		// Start a timer goroutine to enforce the deadline
+		// This ensures stopFlag is set even if workers are in deep search
+		go func() {
+			time.Sleep(limits.MoveTime)
+			e.stopFlag.Store(true)
+		}()
 	}
 
 	// Create result channel
 	resultCh := make(chan WorkerResult, NumWorkers*maxDepth)
 
 	// Start workers
+	// IMPORTANT: Copy position BEFORE spawning goroutines to avoid concurrent reads
 	var wg sync.WaitGroup
 	for i := 0; i < NumWorkers; i++ {
+		workerPos := pos.Copy() // Each worker gets its own dedicated copy
 		wg.Add(1)
-		go e.workerSearch(i, pos, maxDepth, resultCh, &wg)
+		go e.workerSearch(i, workerPos, maxDepth, resultCh, &wg)
 	}
 
 	// Collect results in a separate goroutine
@@ -320,6 +342,14 @@ resultLoop:
 	// Wait for workers to finish
 	<-done
 
+	// Fallback: if no move was found, return first legal move
+	if bestMove == board.NoMove {
+		moves := pos.GenerateLegalMoves()
+		if moves.Len() > 0 {
+			bestMove = moves.Get(0)
+		}
+	}
+
 	return bestMove
 }
 
@@ -376,10 +406,12 @@ func (e *Engine) SearchWithUCILimits(pos *board.Position, limits UCILimits, ply 
 	resultCh := make(chan WorkerResult, NumWorkers*maxDepth)
 
 	// Start workers
+	// IMPORTANT: Copy position BEFORE spawning goroutines to avoid concurrent reads
 	var wg sync.WaitGroup
 	for i := 0; i < NumWorkers; i++ {
+		workerPos := pos.Copy() // Each worker gets its own dedicated copy
 		wg.Add(1)
-		go e.workerSearch(i, pos, maxDepth, resultCh, &wg)
+		go e.workerSearch(i, workerPos, maxDepth, resultCh, &wg)
 	}
 
 	// Collect results in a separate goroutine
@@ -472,6 +504,14 @@ resultLoop:
 	e.stopFlag.Store(true)
 	<-done
 
+	// Fallback: if no move was found, return first legal move
+	if bestMove == board.NoMove {
+		moves := pos.GenerateLegalMoves()
+		if moves.Len() > 0 {
+			bestMove = moves.Get(0)
+		}
+	}
+
 	return bestMove
 }
 
@@ -479,6 +519,25 @@ resultLoop:
 // Uses depth staggering: workers start at different depths to reduce redundant shallow work.
 func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, resultCh chan<- WorkerResult, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	// Recover from panics to prevent silent failures
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERROR: Worker %d panicked: %v", workerID, r)
+			// Send a fallback result with first legal move
+			moves := pos.GenerateLegalMoves()
+			if moves.Len() > 0 {
+				resultCh <- WorkerResult{
+					WorkerID: workerID,
+					Depth:    1,
+					Score:    0,
+					Move:     moves.Get(0),
+					PV:       []board.Move{moves.Get(0)},
+					Nodes:    0,
+				}
+			}
+		}
+	}()
 
 	worker := e.workers[workerID]
 	worker.InitSearch(pos)
@@ -549,7 +608,21 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 			retryCount := 0
 
 			for {
+				// DEBUG: Verify position before search
+				if board.DebugMoveValidation {
+					if worker.Pos().Pieces[board.White][board.King] == 0 {
+						log.Printf("ENGINE: White King MISSING BEFORE SearchDepth! depth=%d", depth)
+					}
+				}
+
 				move, score = worker.SearchDepth(depth, alpha, beta)
+
+				// DEBUG: Verify position wasn't corrupted by search
+				if board.DebugMoveValidation {
+					if worker.Pos().Pieces[board.White][board.King] == 0 {
+						log.Printf("ENGINE: White King MISSING after SearchDepth! depth=%d", depth)
+					}
+				}
 
 				if e.stopFlag.Load() {
 					return
@@ -580,7 +653,19 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 				}
 			}
 		} else {
+			// DEBUG: Verify position before search
+			if board.DebugMoveValidation {
+				if worker.Pos().Pieces[board.White][board.King] == 0 {
+					log.Printf("ENGINE: White King MISSING BEFORE SearchDepth (non-asp)! depth=%d", depth)
+				}
+			}
 			move, score = worker.SearchDepth(depth, -Infinity, Infinity)
+			// DEBUG: Verify position after search
+			if board.DebugMoveValidation {
+				if worker.Pos().Pieces[board.White][board.King] == 0 {
+					log.Printf("ENGINE: White King MISSING after SearchDepth (non-asp)! depth=%d", depth)
+				}
+			}
 		}
 
 		if e.stopFlag.Load() {

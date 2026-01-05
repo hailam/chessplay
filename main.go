@@ -4,8 +4,8 @@ package main
 import (
 	"log"
 
-	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hailam/chessplay/internal/ui"
+	"github.com/hajimehoshi/ebiten/v2"
 )
 
 func main() {

@@ -4,3 +4,4 @@ chessplay
 weights/
 /cpu.pprof
 tmp/
+/*.pgn

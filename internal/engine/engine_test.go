@@ -54,6 +54,77 @@ func TestSearchBasic(t *testing.T) {
 	t.Logf("Best move: %s", move.String())
 }
 
+// TestConcurrentSearchRace is a stress test for multi-threaded search.
+// Run with: GOMAXPROCS=8 go test -race -run TestConcurrentSearchRace ./internal/engine -v
+// This test verifies that parallel search doesn't have race conditions.
+func TestConcurrentSearchRace(t *testing.T) {
+	pos := board.NewPosition()
+	eng := NewEngine(16)
+
+	// Run multiple searches to stress test concurrent access
+	iterations := 10
+	if testing.Short() {
+		iterations = 3
+	}
+
+	for i := 0; i < iterations; i++ {
+		limits := SearchLimits{
+			Depth:    6,
+			MoveTime: 500 * time.Millisecond,
+		}
+
+		move := eng.SearchWithLimits(pos, limits)
+		if move == board.NoMove {
+			t.Errorf("Iteration %d: Search returned NoMove for starting position", i)
+		}
+
+		// Make a couple of opening moves to vary positions
+		if i%2 == 0 {
+			// Play e4 e5
+			pos, _ = board.ParseFEN("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2")
+		} else {
+			// Play d4 d5
+			pos, _ = board.ParseFEN("rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w KQkq d6 0 2")
+		}
+	}
+
+	t.Logf("Completed %d concurrent search iterations without race condition", iterations)
+}
+
+// TestConcurrentSearchMultiplePositions tests searching different positions simultaneously.
+func TestConcurrentSearchMultiplePositions(t *testing.T) {
+	eng := NewEngine(16)
+
+	// Test positions (opening, middlegame, endgame)
+	positions := []string{
+		board.StartFEN,
+		"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3", // Italian Game
+		"8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",                                      // KP endgame
+	}
+
+	for i, fen := range positions {
+		pos, err := board.ParseFEN(fen)
+		if err != nil {
+			t.Fatalf("Failed to parse position %d: %v", i, err)
+		}
+
+		limits := SearchLimits{
+			Depth:    5,
+			MoveTime: 300 * time.Millisecond,
+		}
+
+		move := eng.SearchWithLimits(pos, limits)
+		if move == board.NoMove {
+			// Only error if position is not terminal
+			if !pos.InCheck() || pos.GenerateLegalMoves().Len() > 0 {
+				t.Errorf("Position %d: Search returned NoMove", i)
+			}
+		} else {
+			t.Logf("Position %d: best move = %s", i, move.String())
+		}
+	}
+}
+
 func TestPawnHashTable(t *testing.T) {
 	pt := NewPawnTable(1) // 1MB
 

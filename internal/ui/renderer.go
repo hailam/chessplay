@@ -46,6 +46,7 @@ type Renderer struct {
 	boardSize  int
 	squareSize int
 	scale      float64 // HiDPI scale factor
+	flipped    bool    // True when board is flipped (Black's perspective)
 }
 
 // NewRenderer creates a new renderer.
@@ -63,6 +64,16 @@ func NewRenderer(boardSize, squareSize int) *Renderer {
 func (r *Renderer) SetScale(scale float64) {
 	r.scale = scale
 	r.sprites.SetScale(scale)
+}
+
+// SetFlipped sets whether the board is flipped (Black's perspective at bottom).
+func (r *Renderer) SetFlipped(flipped bool) {
+	r.flipped = flipped
+}
+
+// IsFlipped returns whether the board is flipped.
+func (r *Renderer) IsFlipped() bool {
+	return r.flipped
 }
 
 // s returns the scaled value for rendering.
@@ -202,6 +213,10 @@ func (r *Renderer) DrawDraggedPiece(screen *ebiten.Image, piece board.Piece, mou
 func (r *Renderer) SquareToScreen(sq board.Square) (int, int) {
 	file := sq.File()
 	rank := sq.Rank()
+	if r.flipped {
+		file = 7 - file
+		rank = 7 - rank
+	}
 	x := file * r.squareSize
 	y := (7 - rank) * r.squareSize // Flip so rank 1 is at bottom
 	return x, y
@@ -214,6 +229,10 @@ func (r *Renderer) ScreenToSquare(x, y int) board.Square {
 	}
 	file := x / r.squareSize
 	rank := 7 - (y / r.squareSize) // Flip so rank 1 is at bottom
+	if r.flipped {
+		file = 7 - file
+		rank = 7 - rank
+	}
 	return board.NewSquare(file, rank)
 }
 

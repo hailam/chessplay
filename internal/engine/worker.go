@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"log"
 	"math"
 	"sync/atomic"
 
@@ -85,6 +86,9 @@ type Worker struct {
 	tbProber   tablebase.Prober
 	tbProbeDepth int // Minimum depth to probe TB (default: 1)
 
+	// Debug mode
+	debug bool
+
 	// Communication channel for results
 	resultCh chan<- WorkerResult
 
@@ -162,9 +166,11 @@ func (w *Worker) SetExcludedMoves(moves []board.Move) {
 	w.excludedRootMoves = moves
 }
 
-// InitSearch initializes the worker for a new search with a position copy.
+// InitSearch initializes the worker for a new search.
+// IMPORTANT: pos must be a dedicated copy for this worker (not shared with other goroutines).
+// The caller (engine.workerSearch) is responsible for providing an isolated copy.
 func (w *Worker) InitSearch(pos *board.Position) {
-	w.pos = pos.Copy()
+	w.pos = pos // Use directly - caller provides dedicated copy
 
 	// Reset NNUE accumulator for new search to avoid stale state
 	if w.nnueAcc != nil {
@@ -177,11 +183,26 @@ func (w *Worker) InitSearch(pos *board.Position) {
 	w.posHistory = append(w.posHistory, w.pos.Hash)
 }
 
+// Pos returns the current position (for debugging).
+func (w *Worker) Pos() *board.Position {
+	return w.pos
+}
+
 // SearchDepth performs search at the given depth and sends result via channel.
 func (w *Worker) SearchDepth(depth, alpha, beta int) (board.Move, int) {
 	w.depth = depth
 
-	score := w.negamax(depth, 0, alpha, beta, board.NoMove)
+	// DEBUG: Verify King exists at root
+	if board.DebugMoveValidation {
+		if w.pos.Pieces[board.White][board.King] == 0 {
+			log.Printf("ROOT: White King MISSING at root! depth=%d hash=%x", depth, w.pos.Hash)
+		}
+		if w.pos.Pieces[board.Black][board.King] == 0 {
+			log.Printf("ROOT: Black King MISSING at root! depth=%d hash=%x", depth, w.pos.Hash)
+		}
+	}
+
+	score := w.negamax(depth, 0, alpha, beta, board.NoMove, board.NoMove)
 
 	var bestMove board.Move
 	if w.pv.length[0] > 0 {
@@ -277,7 +298,8 @@ func (w *Worker) isDraw() bool {
 }
 
 // negamax implements the negamax algorithm with alpha-beta pruning.
-func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) int {
+// excludedMove is used for singular extension search - if not NoMove, this move will be skipped.
+func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move) int {
 	// Bounds check to prevent array overflow (can happen with high depth + extensions)
 	// Use MaxPly-1 because we access pv.length[ply+1] inside this function
 	if ply >= MaxPly-1 {
@@ -290,6 +312,31 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 	}
 
 	w.nodes++
+
+	// DEBUG: Comprehensive position validation at EVERY ply
+	if board.DebugMoveValidation {
+		us := w.pos.SideToMove
+		// Check that pieces for "us" are ACTUALLY in Occupied[us]
+		for pt := board.Pawn; pt <= board.King; pt++ {
+			pieceBB := w.pos.Pieces[us][pt]
+			if pieceBB&^w.pos.Occupied[us] != 0 {
+				log.Printf("NEGAMAX ENTRY CORRUPT: %v %v pieces not in Occupied[%v]! ply=%d depth=%d hash=%x prevMove=%v",
+					us, pt, us, ply, depth, w.pos.Hash, prevMove)
+				log.Printf("  PieceBB=%x Occupied[%v]=%x Diff=%x",
+					pieceBB, us, w.pos.Occupied[us], pieceBB&^w.pos.Occupied[us])
+			}
+		}
+		// Check that Occupied[us] matches sum of our pieces
+		var ourSum board.Bitboard
+		for pt := board.Pawn; pt <= board.King; pt++ {
+			ourSum |= w.pos.Pieces[us][pt]
+		}
+		if ourSum != w.pos.Occupied[us] {
+			log.Printf("NEGAMAX ENTRY CORRUPT: %v Occupied mismatch! ply=%d depth=%d hash=%x prevMove=%v",
+				us, ply, depth, w.pos.Hash, prevMove)
+			log.Printf("  Sum=%x Occupied=%x", ourSum, w.pos.Occupied[us])
+		}
+	}
 
 	// Initialize PV length for this ply
 	w.pv.length[ply] = ply
@@ -349,12 +396,10 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		ttMove = ttEntry.BestMove
 		ttPv = ttEntry.IsPV
 
-		// Validate TT move before using (safety check for any edge cases)
-		if ttMove != board.NoMove {
-			piece := w.pos.PieceAt(ttMove.From())
-			if piece == board.NoPiece || piece.Color() != w.pos.SideToMove {
-				ttMove = board.NoMove // Invalidate bad TT move
-			}
+		// Validate TT move immediately (like Stockfish's movepick.cpp)
+		// TT moves can be corrupted due to hash collisions or race conditions
+		if ttMove != board.NoMove && !w.pos.PseudoLegal(ttMove) {
+			ttMove = board.NoMove
 		}
 
 		// Multi-PV: don't use TT cutoffs at root if TT move is excluded
@@ -388,19 +433,6 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Internal Iterative Deepening (IID)
-	if depth >= 4 && ttMove == board.NoMove {
-		iidDepth := depth - 2
-		if iidDepth < 1 {
-			iidDepth = 1
-		}
-		w.negamax(iidDepth, ply, alpha, beta, prevMove)
-		ttEntry, found = w.tt.Probe(w.pos.Hash)
-		if found {
-			ttMove = ttEntry.BestMove
-		}
-	}
-
 	// Quiescence search at depth 0
 	if depth <= 0 {
 		return w.quiescence(ply, alpha, beta)
@@ -408,6 +440,13 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 
 	// Check if in check
 	inCheck := w.pos.InCheck()
+
+	// Internal Iterative Reductions (IIR) - Stockfish approach
+	// When no TT move is available, reduce depth instead of doing recursive search
+	// This avoids undoStack[ply] collision that occurred with recursive IID
+	if depth >= 4 && ttMove == board.NoMove && !inCheck {
+		depth -= 2
+	}
 
 	// Check extension
 	extension := 0
@@ -467,7 +506,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 
 		nullUndo := w.pos.MakeNullMove()
-		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove)
+		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove, board.NoMove)
 		w.pos.UnmakeNullMove(nullUndo)
 
 		if nullScore >= beta {
@@ -475,7 +514,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Probcut
+	// Probcut - prune if a shallow search of captures exceeds beta by a margin
 	if depth >= probcutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
 		probcutBeta := beta + probcutMargin
 		probcutSearchDepth := depth - probcutReduction
@@ -493,11 +532,13 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			w.nnuePush()
 			undo := w.pos.MakeMove(capture)
 			if !undo.Valid {
+				// Move is illegal - undo and try next
+				w.pos.UnmakeMove(capture, undo)
 				w.nnuePop()
 				continue
 			}
 
-			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture)
+			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture, board.NoMove)
 			w.pos.UnmakeMove(capture, undo)
 			w.nnuePop()
 
@@ -507,7 +548,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Multi-Cut
+	// Multi-Cut - if multiple moves fail high at reduced depth, prune
 	if depth >= multicutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
 		mcMoves := w.pos.GenerateLegalMoves()
 		mcScores := w.orderer.ScoreMovesWithCounter(w.pos, mcMoves, ply, ttMove, prevMove)
@@ -526,12 +567,14 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			w.nnuePush()
 			undo := w.pos.MakeMove(move)
 			if !undo.Valid {
+				// Move is illegal - undo and try next
+				w.pos.UnmakeMove(move, undo)
 				w.nnuePop()
 				continue
 			}
 			mcSearched++
 
-			score := -w.negamax(mcSearchDepth, ply+1, -beta, -beta+1, move)
+			score := -w.negamax(mcSearchDepth, ply+1, -beta, -beta+1, move, board.NoMove)
 			w.pos.UnmakeMove(move, undo)
 			w.nnuePop()
 
@@ -553,23 +596,29 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 		}
 	}
 
-	// Singular Extensions
+	// Singular Extensions - DISABLED for debugging position corruption
+	// TODO: Re-enable after root cause is found
 	singularExtension := 0
-	if depth >= 8 && ttMove != board.NoMove && !inCheck &&
-		found && ttEntry.Depth >= int8(depth-3) && ttEntry.Flag != TTUpperBound {
-		rBeta := int(ttEntry.Score) - 200
-		singularDepth := (depth - 3) / 2
-		if singularDepth < 1 {
-			singularDepth = 1
-		}
-		singularScore := w.singularSearch(singularDepth, ply, rBeta-1, rBeta, prevMove, ttMove)
-		if singularScore < rBeta {
-			singularExtension = 1
-		}
-	}
+	_ = singularExtension // Suppress unused warning
 
 	// Generate moves
 	moves := w.pos.GenerateLegalMoves()
+
+	// DEBUG: Verify KingSquare matches King bitboard after move generation
+	if board.DebugMoveValidation {
+		whiteKingBB := w.pos.Pieces[board.White][board.King]
+		blackKingBB := w.pos.Pieces[board.Black][board.King]
+		whiteKingSq := whiteKingBB.LSB()
+		blackKingSq := blackKingBB.LSB()
+		if w.pos.KingSquare[board.White] != whiteKingSq {
+			log.Printf("KINGSQ MISMATCH after movegen! White cached=%v actual=%v ply=%d depth=%d hash=%x",
+				w.pos.KingSquare[board.White], whiteKingSq, ply, depth, w.pos.Hash)
+		}
+		if w.pos.KingSquare[board.Black] != blackKingSq {
+			log.Printf("KINGSQ MISMATCH after movegen! Black cached=%v actual=%v ply=%d depth=%d hash=%x",
+				w.pos.KingSquare[board.Black], blackKingSq, ply, depth, w.pos.Hash)
+		}
+	}
 
 	// Checkmate or stalemate
 	if moves.Len() == 0 {
@@ -593,6 +642,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 
 		// Multi-PV: skip excluded moves at root
 		if ply == 0 && w.isExcludedRootMove(move) {
+			continue
+		}
+
+		// Singular extension: skip the excluded move
+		if move == excludedMove {
 			continue
 		}
 
@@ -631,16 +685,72 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 			}
 		}
 
+		// DEBUG: Verify position consistency BEFORE checking piece
+		{
+			var whiteSum, blackSum board.Bitboard
+			for pt := board.Pawn; pt <= board.King; pt++ {
+				whiteSum |= w.pos.Pieces[board.White][pt]
+				blackSum |= w.pos.Pieces[board.Black][pt]
+			}
+			if whiteSum != w.pos.Occupied[board.White] {
+				log.Printf("PRE-MOVE: White Occupied mismatch! sum=%x Occupied=%x ply=%d depth=%d move=%v hash=%x",
+					whiteSum, w.pos.Occupied[board.White], ply, depth, move, w.pos.Hash)
+			}
+			if blackSum != w.pos.Occupied[board.Black] {
+				log.Printf("PRE-MOVE: Black Occupied mismatch! sum=%x Occupied=%x ply=%d depth=%d move=%v hash=%x",
+					blackSum, w.pos.Occupied[board.Black], ply, depth, move, w.pos.Hash)
+			}
+			if (whiteSum | blackSum) != w.pos.AllOccupied {
+				log.Printf("PRE-MOVE: AllOccupied mismatch! sum=%x AllOccupied=%x ply=%d depth=%d move=%v hash=%x",
+					whiteSum|blackSum, w.pos.AllOccupied, ply, depth, move, w.pos.Hash)
+			}
+		}
+
 		// Make move
 		movingPiece := w.pos.PieceAt(move.From())
 		moveTo := move.To()
 
+		// Defensive skip: validate move matches current side to move
+		// This catches position corruption or stale move data
+		if movingPiece == board.NoPiece || movingPiece.Color() != w.pos.SideToMove {
+			if board.DebugMoveValidation {
+				fromSq := move.From()
+				fromBB := board.SquareBB(fromSq)
+				log.Printf("ERROR: Invalid move! SideToMove=%v, PieceColor=%v, Move=%v, FromSq=%v, Ply=%d, Depth=%d, Hash=%x",
+					w.pos.SideToMove, movingPiece.Color(), move, fromSq, ply, depth, w.pos.Hash)
+				log.Printf("ERROR DETAIL: FromBB=%x AllOccupied=%x InAll=%v InWhite=%v InBlack=%v",
+					fromBB, w.pos.AllOccupied,
+					w.pos.AllOccupied&fromBB != 0,
+					w.pos.Occupied[board.White]&fromBB != 0,
+					w.pos.Occupied[board.Black]&fromBB != 0)
+				// Print what's actually on f1 (sq 5 in standard notation)
+				log.Printf("ERROR: KingSquares White=%v Black=%v", w.pos.KingSquare[board.White], w.pos.KingSquare[board.Black])
+			}
+			continue
+		}
+
+		// DEBUG: Save hash before MakeMove to verify restoration
+		hashBeforeMove := w.pos.Hash
+
+		// DEBUG: Verify King exists BEFORE MakeMove
+		if board.DebugMoveValidation {
+			whiteKingBB := w.pos.Pieces[board.White][board.King]
+			if whiteKingBB == 0 {
+				log.Printf("KING GONE BEFORE MakeMove! ply=%d depth=%d move=%v hash=%x", ply, depth, move, w.pos.Hash)
+			}
+		}
+
 		w.nnuePush()
 		w.undoStack[ply] = w.pos.MakeMove(move)
 		if !w.undoStack[ply].Valid {
+			// Move is illegal - undo the position change and try next move
+			w.pos.UnmakeMove(move, w.undoStack[ply])
 			w.nnuePop()
 			continue
 		}
+
+		// Store hashBeforeMove in undoStack for verification (reusing the Hash field)
+		_ = hashBeforeMove // Will check after UnmakeMove
 
 		// Store move info in search stack for continuation history
 		w.searchStack[ply].currentMove = move
@@ -714,23 +824,58 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove board.Move) i
 				reducedDepth = 1
 			}
 
-			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move)
+			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move, board.NoMove)
 
 			if score > alpha {
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move)
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
 			}
 		} else if movesSearched == 1 {
-			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move)
+			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
 		} else {
-			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move)
+			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move, board.NoMove)
 			if score > alpha && score < beta {
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move)
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
 			}
 		}
 
 		w.posHistory = w.posHistory[:len(w.posHistory)-1]
 		w.pos.UnmakeMove(move, w.undoStack[ply])
 		w.nnuePop()
+
+		// DEBUG: Verify King exists AFTER UnmakeMove
+		if board.DebugMoveValidation {
+			whiteKingBB := w.pos.Pieces[board.White][board.King]
+			if whiteKingBB == 0 {
+				log.Printf("KING GONE AFTER UnmakeMove! ply=%d depth=%d move=%v hash=%x undoHash=%x",
+					ply, depth, move, w.pos.Hash, w.undoStack[ply].Hash)
+			}
+		}
+
+		// DEBUG: Verify position hash was restored correctly after UnmakeMove
+		// The UndoInfo.Hash should contain the hash BEFORE the move was made
+		if w.pos.Hash != w.undoStack[ply].Hash {
+			log.Printf("HASH MISMATCH: Expected=%x Got=%x ply=%d move=%v depth=%d",
+				w.undoStack[ply].Hash, w.pos.Hash, ply, move, depth)
+		}
+
+		// Verify position consistency after UnmakeMove
+		if w.pos.AllOccupied != (w.pos.Occupied[board.White] | w.pos.Occupied[board.Black]) {
+			log.Printf("CORRUPTION: AllOccupied mismatch after UnmakeMove! ply=%d, move=%v", ply, move)
+		}
+		// Verify Occupied[color] matches sum of Pieces[color][*]
+		var whiteOcc, blackOcc board.Bitboard
+		for pt := board.Pawn; pt <= board.King; pt++ {
+			whiteOcc |= w.pos.Pieces[board.White][pt]
+			blackOcc |= w.pos.Pieces[board.Black][pt]
+		}
+		if w.pos.Occupied[board.White] != whiteOcc {
+			log.Printf("CORRUPTION: White Occupied mismatch! Occupied=%x, Pieces sum=%x, ply=%d, move=%v",
+				w.pos.Occupied[board.White], whiteOcc, ply, move)
+		}
+		if w.pos.Occupied[board.Black] != blackOcc {
+			log.Printf("CORRUPTION: Black Occupied mismatch! Occupied=%x, Pieces sum=%x, ply=%d, move=%v",
+				w.pos.Occupied[board.Black], blackOcc, ply, move)
+		}
 
 		if w.stopFlag.Load() {
 			return 0
@@ -893,6 +1038,8 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 		w.nnuePush()
 		undo := w.pos.MakeMove(move)
 		if !undo.Valid {
+			// Move is illegal - undo and try next move
+			w.pos.UnmakeMove(move, undo)
 			w.nnuePop()
 			continue
 		}
@@ -924,6 +1071,8 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 			w.nnuePush()
 			undo := w.pos.MakeMove(move)
 			if !undo.Valid {
+				// Move is illegal - undo and try next move
+				w.pos.UnmakeMove(move, undo)
 				w.nnuePop()
 				continue
 			}
@@ -949,50 +1098,6 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 	}
 
 	return alpha
-}
-
-// singularSearch performs a search excluding a specific move.
-func (w *Worker) singularSearch(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move) int {
-	moves := w.pos.GenerateLegalMoves()
-
-	bestScore := -Infinity
-
-	for i := 0; i < moves.Len(); i++ {
-		move := moves.Get(i)
-
-		if move == excludedMove {
-			continue
-		}
-
-		w.nnuePush()
-		w.undoStack[ply] = w.pos.MakeMove(move)
-		if !w.undoStack[ply].Valid {
-			w.nnuePop()
-			continue
-		}
-
-		w.posHistory = append(w.posHistory, w.pos.Hash)
-
-		score := -w.negamax(depth-1, ply+1, -beta, -alpha, move)
-
-		w.posHistory = w.posHistory[:len(w.posHistory)-1]
-		w.pos.UnmakeMove(move, w.undoStack[ply])
-		w.nnuePop()
-
-		if score > bestScore {
-			bestScore = score
-		}
-
-		if score >= beta {
-			return score
-		}
-	}
-
-	if bestScore == -Infinity {
-		return alpha
-	}
-
-	return bestScore
 }
 
 // detectSeriousThreats checks if opponent has serious threats against our pieces.

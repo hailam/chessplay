@@ -33,6 +33,18 @@ func (p *Position) generateAllMoves(ml *MoveList) {
 	occupied := p.AllOccupied
 	enemies := p.Occupied[them]
 
+	// Validate King position consistency
+	if DebugMoveValidation {
+		kingBB := p.Pieces[us][King]
+		if kingBB == 0 {
+			log.Printf("MOVEGEN FATAL: %v King bitboard empty! KingSquare=%v AllOcc=%x Hash=%x",
+				us, p.KingSquare[us], uint64(p.AllOccupied), p.Hash)
+		} else if p.KingSquare[us] != kingBB.LSB() {
+			log.Printf("MOVEGEN FATAL: %v KingSquare=%v but King bitboard says %v! Hash=%x",
+				us, p.KingSquare[us], kingBB.LSB(), p.Hash)
+		}
+	}
+
 	// Pawn moves
 	p.generatePawnMoves(ml, us, enemies, occupied)
 
@@ -190,7 +202,13 @@ func addPromotions(ml *MoveList, from, to Square) {
 
 // generateKingMoves generates king moves (non-castling).
 func (p *Position) generateKingMoves(ml *MoveList, us Color) {
-	from := p.KingSquare[us]
+	// Use actual King bitboard to find King position (defensive against desync)
+	kingBB := p.Pieces[us][King]
+	if kingBB == 0 {
+		// No King on board - skip (this is a corrupted position)
+		return
+	}
+	from := kingBB.LSB()
 	attacks := KingAttacks(from) & ^p.Occupied[us]
 
 	for attacks != 0 {
@@ -576,15 +594,6 @@ func (p *Position) IsLegal(m Move) bool {
 	// After MakeMove, SideToMove is flipped, so "them" is now "us"
 	attacked := p.IsSquareAttacked(ksq, them)
 
-	// DEBUG: Log rejected moves
-	if attacked {
-		fmt.Printf("DEBUG: Move %v rejected - king on %v attacked by %v after move\n",
-			m, ksq, them)
-		// Show what's attacking the king
-		attackers := p.AttackersByColor(ksq, them, p.AllOccupied)
-		fmt.Printf("DEBUG: Attackers bitboard:\n%s\n", attackers.String())
-	}
-
 	p.UnmakeMove(m, undo)
 
 	return !attacked
@@ -657,6 +666,27 @@ func (p *Position) generateChecks(ml *MoveList) {
 
 // MakeMove applies a move to the position and returns undo information.
 func (p *Position) MakeMove(m Move) UndoInfo {
+	// DEBUG: Check position BEFORE saving undo
+	if DebugMoveValidation {
+		us := p.SideToMove
+		them := us.Other()
+		// Check our King exists
+		if p.Pieces[us][King] == 0 {
+			log.Printf("MAKEMOVE ENTRY: %v King bitboard empty! move=%v hash=%x", us, m, p.Hash)
+		}
+		// Check opponent King exists (should never capture King)
+		if p.Pieces[them][King] == 0 {
+			log.Printf("MAKEMOVE ENTRY: %v (opponent) King bitboard empty! move=%v hash=%x", them, m, p.Hash)
+		}
+		// Check if move is trying to capture King
+		to := m.To()
+		capturedPiece := p.PieceAt(to)
+		if capturedPiece != NoPiece && capturedPiece.Type() == King {
+			log.Printf("MAKEMOVE ILLEGAL: Trying to capture %v King at %v! move=%v hash=%x",
+				capturedPiece.Color(), to, m, p.Hash)
+		}
+	}
+
 	undo := UndoInfo{
 		CapturedPiece:  NoPiece,
 		CastlingRights: p.CastlingRights,
@@ -665,6 +695,10 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 		Hash:           p.Hash,
 		PawnKey:        p.PawnKey,
 		Checkers:       p.Checkers,
+		KingSquare:     p.KingSquare,   // Save King positions
+		Pieces:         p.Pieces,       // Save all piece bitboards
+		Occupied:       p.Occupied,     // Save occupancy bitboards
+		AllOccupied:    p.AllOccupied,  // Save all occupied
 		Valid:          false,
 	}
 
@@ -679,10 +713,12 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 		return undo
 	}
 
-	// Validate piece belongs to side to move - critical for catching bugs
+	// Validate piece belongs to side to move - catches hash collisions and bugs
 	if piece.Color() != us {
-		log.Printf("ERROR: MakeMove - trying to move %v piece when %v to move! Move: %v (from=%v to=%v)",
-			piece.Color(), us, m, from, to)
+		if DebugMoveValidation {
+			log.Printf("DEBUG: MakeMove - trying to move %v piece when %v to move! Move: %v (from=%v to=%v)",
+				piece.Color(), us, m, from, to)
+		}
 		return undo
 	}
 
@@ -814,71 +850,44 @@ func (p *Position) MakeMove(m Move) UndoInfo {
 	// Switch side to move
 	p.SideToMove = them
 
-	// Update checkers
+	// Update checkers (for the side now to move)
 	p.UpdateCheckers()
+
+	// CRITICAL: Verify the side that just moved didn't leave their King in check
+	// This catches illegal moves that slipped through move generation
+	usKingSq := p.KingSquare[us]
+	if p.IsSquareAttacked(usKingSq, them) {
+		// Move is illegal - leaves own King in check
+		if DebugMoveValidation {
+			log.Printf("MAKEMOVE ILLEGAL: %v left King at %v in check! move=%v hash=%x",
+				us, usKingSq, m, p.Hash)
+		}
+		undo.Valid = false
+	}
 
 	return undo
 }
 
 // UnmakeMove undoes a move using the stored undo information.
+// Uses full position restoration to avoid issues with movePiece failures.
 func (p *Position) UnmakeMove(m Move, undo UndoInfo) {
-	them := p.SideToMove
-	us := them.Other()
-	from := m.From()
-	to := m.To()
+	us := p.SideToMove.Other()
 
-	// Restore state
+	// Directly restore all position state from undo
 	p.CastlingRights = undo.CastlingRights
 	p.EnPassant = undo.EnPassant
 	p.HalfMoveClock = undo.HalfMoveClock
 	p.Hash = undo.Hash
 	p.PawnKey = undo.PawnKey
 	p.Checkers = undo.Checkers
+	p.KingSquare = undo.KingSquare
+	p.Pieces = undo.Pieces
+	p.Occupied = undo.Occupied
+	p.AllOccupied = undo.AllOccupied
 	p.SideToMove = us
 
 	if us == Black {
 		p.FullMoveNumber--
-	}
-
-	// Handle promotion first (before moving piece back)
-	if m.IsPromotion() {
-		promoPt := m.Promotion()
-		// Remove promoted piece, restore pawn
-		p.Pieces[us][promoPt] &^= SquareBB(to)
-		p.Pieces[us][Pawn] |= SquareBB(to)
-	}
-
-	// Move piece back
-	p.movePiece(to, from)
-
-	// Handle castling rook
-	if m.IsCastling() {
-		var rookFrom, rookTo Square
-		if to > from {
-			// Kingside
-			rookFrom = NewSquare(7, from.Rank())
-			rookTo = NewSquare(5, from.Rank())
-		} else {
-			// Queenside
-			rookFrom = NewSquare(0, from.Rank())
-			rookTo = NewSquare(3, from.Rank())
-		}
-		p.movePiece(rookTo, rookFrom)
-	}
-
-	// Restore captured piece
-	if undo.CapturedPiece != NoPiece {
-		if m.IsEnPassant() {
-			var capturedSq Square
-			if us == White {
-				capturedSq = to - 8
-			} else {
-				capturedSq = to + 8
-			}
-			p.setPiece(undo.CapturedPiece, capturedSq)
-		} else {
-			p.setPiece(undo.CapturedPiece, to)
-		}
 	}
 }
 

@@ -72,10 +72,11 @@ type Game struct {
 	lastMove       board.Move
 
 	// Game settings
-	mode       GameMode
-	difficulty Difficulty
-	evalMode   EvalMode
-	username   string
+	mode        GameMode
+	difficulty  Difficulty
+	evalMode    EvalMode
+	username    string
+	playerColor board.Color // Which color the human plays (default: White)
 
 	// Storage
 	storage *storage.Storage
@@ -123,6 +124,7 @@ func NewGame() *Game {
 		difficulty:     DifficultyMedium,
 		evalMode:       EvalClassical,
 		username:       "Player",
+		playerColor:    board.White, // Human plays White by default
 		renderer:       NewRenderer(BoardSize, SquareSize),
 		input:          NewInputHandler(),
 		engine:         engine.NewEngine(64), // 64MB hash table
@@ -184,6 +186,15 @@ func (g *Game) loadPreferences() {
 	g.evalMode = EvalMode(g.prefs.EvalMode)
 	g.mode = GameMode(g.prefs.GameMode)
 
+	// Apply player color (convert from storage.PlayerColor to board.Color)
+	if g.prefs.PlayerColor == storage.ColorBlack {
+		g.playerColor = board.Black
+		g.renderer.SetFlipped(true)
+	} else {
+		g.playerColor = board.White
+		g.renderer.SetFlipped(false)
+	}
+
 	// Update engine difficulty
 	switch g.difficulty {
 	case DifficultyEasy:
@@ -213,6 +224,13 @@ func (g *Game) savePreferences() {
 	g.prefs.Difficulty = storage.Difficulty(g.difficulty)
 	g.prefs.EvalMode = storage.EvalMode(g.evalMode)
 	g.prefs.GameMode = storage.GameMode(g.mode)
+
+	// Convert board.Color to storage.PlayerColor
+	if g.playerColor == board.Black {
+		g.prefs.PlayerColor = storage.ColorBlack
+	} else {
+		g.prefs.PlayerColor = storage.ColorWhite
+	}
 
 	if err := g.storage.SavePreferences(g.prefs); err != nil {
 		log.Printf("Warning: Failed to save preferences: %v", err)
@@ -409,8 +427,8 @@ func (g *Game) handleBoardInput() {
 		return
 	}
 
-	// Only allow moves for current player in human vs computer mode
-	if g.mode == ModeHumanVsComputer && g.position.SideToMove == board.Black {
+	// Only allow moves for human player in human vs computer mode
+	if g.mode == ModeHumanVsComputer && g.position.SideToMove != g.playerColor {
 		return
 	}
 
@@ -622,7 +640,7 @@ func (g *Game) makeMove(m board.Move) {
 	g.checkGameEnd()
 
 	// Start AI thinking if it's computer's turn
-	if !g.gameOver && g.mode == ModeHumanVsComputer && g.position.SideToMove == board.Black {
+	if !g.gameOver && g.mode == ModeHumanVsComputer && g.position.SideToMove != g.playerColor {
 		g.startAIThinking()
 	}
 }
@@ -683,9 +701,9 @@ func (g *Game) isThreefoldRepetition() bool {
 
 // startAIThinking starts the AI search in a goroutine.
 func (g *Game) startAIThinking() {
-	// Assertion: AI should only think when it's Black's turn
-	if g.position.SideToMove != board.Black {
-		log.Printf("ERROR: startAIThinking called but SideToMove is %v (expected Black)!",
+	// Assertion: AI should only think when it's computer's turn
+	if g.position.SideToMove == g.playerColor {
+		log.Printf("ERROR: startAIThinking called but SideToMove is %v (player's turn)!",
 			g.position.SideToMove)
 		return
 	}
@@ -747,6 +765,11 @@ func (g *Game) NewGameAction() {
 	case <-g.aiMove:
 	default:
 	}
+
+	// If player chose Black, AI (White) moves first
+	if g.mode == ModeHumanVsComputer && g.playerColor == board.Black {
+		g.startAIThinking()
+	}
 }
 
 // ToggleModeAction toggles between Human vs Human and Human vs Computer.
@@ -756,6 +779,19 @@ func (g *Game) ToggleModeAction() {
 	} else {
 		g.mode = ModeHumanVsHuman
 	}
+}
+
+// SetPlayerColor sets which color the human player controls.
+// When set to Black, the board will be flipped and AI will move first.
+func (g *Game) SetPlayerColor(color board.Color) {
+	g.playerColor = color
+	// Flip board so player's pieces are at the bottom
+	g.renderer.SetFlipped(color == board.Black)
+}
+
+// PlayerColor returns the color the human player controls.
+func (g *Game) PlayerColor() board.Color {
+	return g.playerColor
 }
 
 // SetDifficulty sets the AI difficulty.
@@ -832,6 +868,14 @@ func (g *Game) ShowSettings() {
 		g.prefs.Username = prefs.Username
 		g.prefs.Difficulty = prefs.Difficulty
 		g.prefs.EvalMode = prefs.EvalMode
+		g.prefs.PlayerColor = prefs.PlayerColor
+
+		// Apply player color (convert from storage.PlayerColor to board.Color)
+		if prefs.PlayerColor == storage.ColorBlack {
+			g.SetPlayerColor(board.Black)
+		} else {
+			g.SetPlayerColor(board.White)
+		}
 
 		// Handle NNUE mode - check if networks need downloading
 		if prefs.EvalMode == storage.EvalNNUE {
@@ -913,8 +957,8 @@ func (g *Game) startAssistAnalysis() {
 	if g.difficulty != DifficultyEasy {
 		return
 	}
-	// Only when it's human's turn (White in HvC mode)
-	if g.mode == ModeHumanVsComputer && g.position.SideToMove != board.White {
+	// Only when it's human's turn in HvC mode
+	if g.mode == ModeHumanVsComputer && g.position.SideToMove != g.playerColor {
 		return
 	}
 	// Don't run if game is over or AI is thinking

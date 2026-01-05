@@ -255,5 +255,14 @@ func (p *Position) IsSquareAttacked(sq Square, byColor Color) bool {
 
 // UpdateCheckers updates the Checkers bitboard for the side to move.
 func (p *Position) UpdateCheckers() {
-	p.Checkers = p.AttackersByColor(p.KingSquare[p.SideToMove], p.SideToMove.Other(), p.AllOccupied)
+	// Use actual King bitboard for defensive correctness
+	us := p.SideToMove
+	kingBB := p.Pieces[us][King]
+	if kingBB == 0 {
+		// No King on board - can't compute checkers, set to 0
+		p.Checkers = 0
+		return
+	}
+	kingSq := kingBB.LSB()
+	p.Checkers = p.AttackersByColor(kingSq, us.Other(), p.AllOccupied)
 }

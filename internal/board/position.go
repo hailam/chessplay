@@ -1,6 +1,10 @@
 package board
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+	"runtime/debug"
+)
 
 // CastlingRights represents the available castling options.
 type CastlingRights uint8
@@ -151,6 +155,14 @@ func (p *Position) removePiece(sq Square) Piece {
 	pt := piece.Type()
 	bb := SquareBB(sq)
 
+	// CRITICAL: Detect if we're trying to remove a King (should never happen!)
+	if pt == King {
+		log.Printf("CRITICAL BUG: removePiece called on %v King at %v! KingSquare[%v]=%v Hash=%x",
+			c, sq, c, p.KingSquare[c], p.Hash)
+		// Print stack trace to find caller
+		debug.PrintStack()
+	}
+
 	p.Pieces[c][pt] &^= bb
 	p.Occupied[c] &^= bb
 	p.AllOccupied &^= bb
@@ -162,6 +174,10 @@ func (p *Position) removePiece(sq Square) Piece {
 func (p *Position) movePiece(from, to Square) {
 	piece := p.PieceAt(from)
 	if piece == NoPiece {
+		if DebugMoveValidation {
+			log.Printf("MOVPIECE FAIL: No piece at %v to move to %v! KingSquares=%v,%v AllOccupied=%x",
+				from, to, p.KingSquare[White], p.KingSquare[Black], uint64(p.AllOccupied))
+		}
 		return
 	}
 
@@ -252,6 +268,49 @@ func (p *Position) Validate() error {
 
 	// Check that opponent's king is not in check (would be illegal position)
 	// This will be implemented after attack generation
+
+	return nil
+}
+
+// Verify checks internal consistency of position state.
+// Returns error if occupancy bitboards don't match piece bitboards.
+// Used for debugging race conditions in multi-threaded search.
+func (p *Position) Verify() error {
+	// Recompute occupancy from pieces
+	computedWhite := Bitboard(0)
+	computedBlack := Bitboard(0)
+	for pt := Pawn; pt <= King; pt++ {
+		computedWhite |= p.Pieces[White][pt]
+		computedBlack |= p.Pieces[Black][pt]
+	}
+
+	if computedWhite != p.Occupied[White] {
+		return fmt.Errorf("white occupancy mismatch: computed=%064b stored=%064b",
+			computedWhite, p.Occupied[White])
+	}
+	if computedBlack != p.Occupied[Black] {
+		return fmt.Errorf("black occupancy mismatch: computed=%064b stored=%064b",
+			computedBlack, p.Occupied[Black])
+	}
+	if (computedWhite | computedBlack) != p.AllOccupied {
+		return fmt.Errorf("allOccupied mismatch: computed=%064b stored=%064b",
+			computedWhite|computedBlack, p.AllOccupied)
+	}
+	if computedWhite&computedBlack != 0 {
+		return fmt.Errorf("white/black overlap: %064b", computedWhite&computedBlack)
+	}
+
+	// Verify king squares match
+	whiteKingBB := p.Pieces[White][King]
+	blackKingBB := p.Pieces[Black][King]
+	if whiteKingBB != 0 && whiteKingBB.LSB() != p.KingSquare[White] {
+		return fmt.Errorf("white king square mismatch: bb=%s stored=%s",
+			whiteKingBB.LSB(), p.KingSquare[White])
+	}
+	if blackKingBB != 0 && blackKingBB.LSB() != p.KingSquare[Black] {
+		return fmt.Errorf("black king square mismatch: bb=%s stored=%s",
+			blackKingBB.LSB(), p.KingSquare[Black])
+	}
 
 	return nil
 }
@@ -360,4 +419,108 @@ func (p *Position) UnmakeNullMove(undo NullMoveUndo) {
 func (p *Position) HasNonPawnMaterial() bool {
 	us := p.SideToMove
 	return p.Pieces[us][Knight]|p.Pieces[us][Bishop]|p.Pieces[us][Rook]|p.Pieces[us][Queen] != 0
+}
+
+// DebugMoveValidation enables debug logging for move validation errors.
+// Set to true to see when invalid TT moves are detected (hash collisions).
+var DebugMoveValidation = true
+
+// PseudoLegal validates if a move could be legal for this position.
+// Used to validate TT moves that may be corrupted due to hash collisions.
+// This follows Stockfish's pseudo_legal() function approach.
+func (p *Position) PseudoLegal(m Move) bool {
+	if m == NoMove {
+		return false
+	}
+
+	us := p.SideToMove
+	from := m.From()
+	to := m.To()
+	piece := p.PieceAt(from)
+
+	// Piece must exist and belong to side to move
+	if piece == NoPiece || piece.Color() != us {
+		return false
+	}
+
+	// Destination cannot have friendly piece
+	destPiece := p.PieceAt(to)
+	if destPiece != NoPiece && destPiece.Color() == us {
+		return false
+	}
+
+	// For special moves (promotion, en passant, castling), do full validation
+	if m.Flag() != FlagNormal {
+		legal := p.GenerateLegalMoves()
+		return legal.Contains(m)
+	}
+
+	pt := piece.Type()
+
+	// Validate pawn moves
+	if pt == Pawn {
+		direction := int(to) - int(from)
+		if us == White {
+			// White pawns move up (positive direction)
+			// Single push: +8, double push: +16, captures: +7, +9
+			if direction != 8 && direction != 16 && direction != 7 && direction != 9 {
+				return false
+			}
+			// Double push only from rank 2
+			if direction == 16 && from.Rank() != 1 {
+				return false
+			}
+			// Captures must have enemy piece
+			if (direction == 7 || direction == 9) && destPiece == NoPiece {
+				return false
+			}
+		} else {
+			// Black pawns move down (negative direction)
+			// Single push: -8, double push: -16, captures: -7, -9
+			if direction != -8 && direction != -16 && direction != -7 && direction != -9 {
+				return false
+			}
+			// Double push only from rank 7
+			if direction == -16 && from.Rank() != 6 {
+				return false
+			}
+			// Captures must have enemy piece
+			if (direction == -7 || direction == -9) && destPiece == NoPiece {
+				return false
+			}
+		}
+		return true
+	}
+
+	// For non-pawn pieces, validate the attack pattern
+	fromBB := SquareBB(from)
+	toBB := SquareBB(to)
+
+	switch pt {
+	case Knight:
+		if KnightAttacks(from)&toBB == 0 {
+			return false
+		}
+	case Bishop:
+		if BishopAttacks(from, p.AllOccupied)&toBB == 0 {
+			return false
+		}
+	case Rook:
+		if RookAttacks(from, p.AllOccupied)&toBB == 0 {
+			return false
+		}
+	case Queen:
+		if QueenAttacks(from, p.AllOccupied)&toBB == 0 {
+			return false
+		}
+	case King:
+		if KingAttacks(from)&toBB == 0 {
+			return false
+		}
+	default:
+		_ = fromBB // silence unused warning
+		return false
+	}
+
+	return true
 }

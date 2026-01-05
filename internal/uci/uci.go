@@ -67,6 +67,8 @@ func (u *UCI) Run() {
 		case "ucinewgame":
 			u.handleNewGame()
 		case "position":
+			// Debug: log the exact position command
+			fmt.Fprintf(os.Stderr, "info string DEBUG: position %s\n", strings.Join(args, " "))
 			u.handlePosition(args)
 		case "go":
 			u.handleGo(args)
@@ -176,6 +178,15 @@ func (u *UCI) handlePosition(args []string) {
 			u.positionHashes = append(u.positionHashes, u.position.Hash)
 		}
 	}
+
+	// Debug: log position state after setup
+	legal := u.position.GenerateLegalMoves()
+	var legalStrs []string
+	for i := 0; i < legal.Len() && i < 8; i++ {
+		legalStrs = append(legalStrs, legal.Get(i).String())
+	}
+	fmt.Fprintf(os.Stderr, "info string DEBUG: After position setup - hash=%016x inCheck=%v legal=%v...\n",
+		u.position.Hash, u.position.InCheck(), legalStrs)
 }
 
 // parseMove converts a UCI move string to a board.Move.
@@ -271,9 +282,42 @@ func (u *UCI) handleGo(args []string) {
 		bestMove := u.engine.SearchWithLimits(pos, limits)
 
 		u.searching = false
+
+		// Validate move is legal before sending
+		// Use fresh copy of original position for validation (search may have corrupted pos)
+		validationPos := u.position.Copy()
 		if bestMove != board.NoMove {
-			fmt.Printf("bestmove %s\n", bestMove.String())
+			legal := validationPos.GenerateLegalMoves()
+			found := false
+			for i := 0; i < legal.Len(); i++ {
+				if legal.Get(i) == bestMove {
+					found = true
+					break
+				}
+			}
+			if found {
+				fmt.Fprintf(os.Stderr, "info string DEBUG: Sending bestmove %s (hash=%016x)\n", bestMove.String(), validationPos.Hash)
+				fmt.Printf("bestmove %s\n", bestMove.String())
+				return
+			}
+			// Move not legal - log detailed warning
+			fmt.Fprintf(os.Stderr, "info string CRITICAL: Search returned illegal move %s (not in %d legal moves)\n", bestMove.String(), legal.Len())
+			// Log all legal moves for debugging
+			var legalStrs []string
+			for i := 0; i < legal.Len() && i < 10; i++ {
+				legalStrs = append(legalStrs, legal.Get(i).String())
+			}
+			fmt.Fprintf(os.Stderr, "info string Legal moves (first 10): %v\n", legalStrs)
 		} else {
+			fmt.Fprintf(os.Stderr, "info string WARNING: Search returned NoMove, using fallback\n")
+		}
+
+		// Fallback: return first legal move if available
+		legal := validationPos.GenerateLegalMoves()
+		if legal.Len() > 0 {
+			fmt.Printf("bestmove %s\n", legal.Get(0).String())
+		} else {
+			// Only send 0000 for checkmate/stalemate (no legal moves)
 			fmt.Println("bestmove 0000")
 		}
 	}()
@@ -447,13 +491,29 @@ func (u *UCI) sendInfo(info engine.SearchInfo) {
 		parts = append(parts, fmt.Sprintf("hashfull %d", info.HashFull))
 	}
 
-	// PV
+	// PV - validate moves to prevent outputting illegal sequences
 	if len(info.PV) > 0 {
-		pvStr := make([]string, len(info.PV))
-		for i, move := range info.PV {
-			pvStr[i] = move.String()
+		validPV := make([]string, 0, len(info.PV))
+		testPos := u.position.Copy()
+		for _, move := range info.PV {
+			// Validate move is legal in current test position
+			legal := testPos.GenerateLegalMoves()
+			isLegal := false
+			for i := 0; i < legal.Len(); i++ {
+				if legal.Get(i) == move {
+					isLegal = true
+					break
+				}
+			}
+			if !isLegal {
+				break // Stop at first illegal move
+			}
+			validPV = append(validPV, move.String())
+			testPos.MakeMove(move)
 		}
-		parts = append(parts, "pv "+strings.Join(pvStr, " "))
+		if len(validPV) > 0 {
+			parts = append(parts, "pv "+strings.Join(validPV, " "))
+		}
 	}
 
 	fmt.Printf("info %s\n", strings.Join(parts, " "))
