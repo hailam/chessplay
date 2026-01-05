@@ -67,8 +67,9 @@ func (u *UCI) Run() {
 		case "ucinewgame":
 			u.handleNewGame()
 		case "position":
-			// Debug: log the exact position command
-			fmt.Fprintf(os.Stderr, "info string DEBUG: position %s\n", strings.Join(args, " "))
+			if board.DebugMoveValidation {
+				fmt.Fprintf(os.Stderr, "info string DEBUG: position %s\n", strings.Join(args, " "))
+			}
 			u.handlePosition(args)
 		case "go":
 			u.handleGo(args)
@@ -180,13 +181,15 @@ func (u *UCI) handlePosition(args []string) {
 	}
 
 	// Debug: log position state after setup
-	legal := u.position.GenerateLegalMoves()
-	var legalStrs []string
-	for i := 0; i < legal.Len() && i < 8; i++ {
-		legalStrs = append(legalStrs, legal.Get(i).String())
+	if board.DebugMoveValidation {
+		legal := u.position.GenerateLegalMoves()
+		var legalStrs []string
+		for i := 0; i < legal.Len() && i < 8; i++ {
+			legalStrs = append(legalStrs, legal.Get(i).String())
+		}
+		fmt.Fprintf(os.Stderr, "info string DEBUG: After position setup - hash=%016x inCheck=%v legal=%v...\n",
+			u.position.Hash, u.position.InCheck(), legalStrs)
 	}
-	fmt.Fprintf(os.Stderr, "info string DEBUG: After position setup - hash=%016x inCheck=%v legal=%v...\n",
-		u.position.Hash, u.position.InCheck(), legalStrs)
 }
 
 // parseMove converts a UCI move string to a board.Move.
@@ -296,7 +299,9 @@ func (u *UCI) handleGo(args []string) {
 				}
 			}
 			if found {
-				fmt.Fprintf(os.Stderr, "info string DEBUG: Sending bestmove %s (hash=%016x)\n", bestMove.String(), validationPos.Hash)
+				if board.DebugMoveValidation {
+					fmt.Fprintf(os.Stderr, "info string DEBUG: Sending bestmove %s (hash=%016x)\n", bestMove.String(), validationPos.Hash)
+				}
 				fmt.Printf("bestmove %s\n", bestMove.String())
 				return
 			}
@@ -595,6 +600,12 @@ func (u *UCI) handleSetOption(args []string) {
 		if err == nil && depth >= 1 {
 			u.syzygyProbeDepth = depth
 			u.engine.SetSyzygyProbeDepth(depth)
+		}
+	case "debug":
+		enabled := strings.ToLower(value) == "true"
+		board.DebugMoveValidation = enabled
+		if enabled {
+			fmt.Fprintf(os.Stderr, "info string Debug mode enabled\n")
 		}
 	}
 }

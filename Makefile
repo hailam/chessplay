@@ -62,11 +62,12 @@ gen-pprof:
 # 6. Elo Testing (Targets the UCI binary)
 # Multi-threaded Lazy SMP search enabled
 test-elo: uci
+	rm -f results.pgn
 	@echo "Starting Elo benchmark: $(BINARY_UCI) vs Stockfish (multi-threaded)"
 	$(CHESS_CLI) \
-		-each tc=10+0.1 \
+		-each tc=13+0.1 \
 		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go \
-		-engine cmd=$(STOCKFISH) name=Stockfish \
+		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=5 \
 		-concurrency 2 \
 		-rounds 5 \
 		-pgn results.pgn

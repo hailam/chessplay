@@ -423,7 +423,8 @@ func (p *Position) HasNonPawnMaterial() bool {
 
 // DebugMoveValidation enables debug logging for move validation errors.
 // Set to true to see when invalid TT moves are detected (hash collisions).
-var DebugMoveValidation = true
+// Can be enabled via UCI option "Debug".
+var DebugMoveValidation = false
 
 // PseudoLegal validates if a move could be legal for this position.
 // Used to validate TT moves that may be corrupted due to hash collisions.

@@ -75,6 +75,7 @@ func ParseFEN(fen string) (*Position, error) {
 	pos.findKings()
 	pos.Hash = pos.ComputeHash()
 	pos.PawnKey = pos.ComputePawnKey()
+	pos.UpdateCheckers()
 
 	return pos, nil
 }
