@@ -593,6 +593,21 @@ func (g *Game) findMove(src, dst board.Square) board.Move {
 			}
 			return move
 		}
+
+		// Handle castling: allow dragging King to Rook square
+		// Users naturally castle by moving King to Rook, but internal moves use King's destination
+		if move.IsCastling() && move.From() == src {
+			// Kingside: E1→H1 (White) or E8→H8 (Black) should match E1→G1 / E8→G8
+			if (src == board.E1 && dst == board.H1 && move.To() == board.G1) ||
+				(src == board.E8 && dst == board.H8 && move.To() == board.G8) {
+				return move
+			}
+			// Queenside: E1→A1 (White) or E8→A8 (Black) should match E1→C1 / E8→C8
+			if (src == board.E1 && dst == board.A1 && move.To() == board.C1) ||
+				(src == board.E8 && dst == board.A8 && move.To() == board.C8) {
+				return move
+			}
+		}
 	}
 
 	return board.NoMove
