@@ -993,6 +993,7 @@ func (w *Worker) quiescence(ply int, alpha, beta int) int {
 }
 
 // quiescenceInternal is the internal quiescence search with qPly tracking.
+// Fixed to match Stockfish: TT probe, proper in-check handling, SEE pruning.
 func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 	const maxQuiescencePly = 32
 	if ply >= MaxPly || qPly > maxQuiescencePly {
@@ -1004,65 +1005,125 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 	}
 
 	w.nodes++
+	originalAlpha := alpha
 
-	// Lazy evaluation
-	lazyEval := EvaluateMaterial(w.pos)
-	if lazyEval-lazyEvalMargin >= beta {
-		return beta
+	// TT Probe - critical for QS performance
+	var ttMove board.Move
+	ttEntry, ttHit := w.tt.Probe(w.pos.Hash)
+	if ttHit {
+		ttMove = ttEntry.BestMove
+		// Validate TT move (can be corrupted by hash collision)
+		if ttMove != board.NoMove && !w.pos.PseudoLegal(ttMove) {
+			ttMove = board.NoMove
+		}
+		// TT cutoff - depth >= 0 is sufficient for QS
+		if ttEntry.Depth >= 0 {
+			score := AdjustScoreFromTT(int(ttEntry.Score), ply)
+			switch ttEntry.Flag {
+			case TTExact:
+				return score
+			case TTLowerBound:
+				if score >= beta {
+					return score
+				}
+			case TTUpperBound:
+				if score <= alpha {
+					return score
+				}
+			}
+		}
 	}
-	if lazyEval+lazyEvalMargin <= alpha {
-		return alpha
+
+	// Check detection - critical: NO standing pat when in check
+	inCheck := w.pos.InCheck()
+
+	var standPat, bestValue int
+	var bestMove board.Move
+
+	if inCheck {
+		// When in check, we MUST make a move - no standing pat allowed
+		// Start with worst possible score (will be checkmate if no legal moves)
+		bestValue = -MateScore + ply
+		standPat = bestValue
+	} else {
+		// Lazy evaluation cutoff (only when not in check)
+		lazyEval := EvaluateMaterial(w.pos)
+		if lazyEval-lazyEvalMargin >= beta {
+			return beta
+		}
+		if lazyEval+lazyEvalMargin <= alpha {
+			return alpha
+		}
+
+		// Stand pat - can choose not to capture
+		standPat = w.evaluate()
+		bestValue = standPat
+
+		if standPat >= beta {
+			// Store stand pat cutoff in TT
+			w.tt.Store(w.pos.Hash, 0, AdjustScoreToTT(standPat, ply), TTLowerBound, board.NoMove, false)
+			return beta
+		}
+
+		if standPat > alpha {
+			alpha = standPat
+		}
+
+		// Big delta pruning - if even capturing a queen can't raise alpha, give up
+		if standPat+QueenValue < alpha {
+			return alpha
+		}
 	}
 
-	// Stand pat
-	standPat := w.evaluate()
-
-	if standPat >= beta {
-		return beta
+	// Move generation: evasions when in check, captures otherwise
+	var moves *board.MoveList
+	if inCheck {
+		// When in check, must search ALL legal moves (evasions)
+		moves = w.pos.GenerateLegalMoves()
+	} else {
+		// Normal QS: only captures
+		moves = w.pos.GenerateCaptures()
 	}
 
-	if standPat > alpha {
-		alpha = standPat
-	}
-
-	// Delta pruning
-	bigDelta := QueenValue
-	if standPat+bigDelta < alpha {
-		return alpha
-	}
-
-	// Generate captures only
-	moves := w.pos.GenerateCaptures()
-	scores := w.orderer.ScoreMoves(w.pos, moves, ply, board.NoMove)
+	// Move ordering with TT move priority
+	scores := w.orderer.ScoreMoves(w.pos, moves, ply, ttMove)
 
 	for i := 0; i < moves.Len(); i++ {
 		PickMove(moves, scores, i)
 		move := moves.Get(i)
 
-		// Delta pruning for individual moves
-		if !w.pos.InCheck() {
-			var captureValue int
-			if move.IsEnPassant() {
-				captureValue = PawnValue
-			} else {
-				capturedPiece := w.pos.PieceAt(move.To())
-				if capturedPiece != board.NoPiece {
-					captureValue = pieceValues[capturedPiece.Type()]
+		// Pruning only when NOT in check and move is a capture
+		if !inCheck && move.IsCapture(w.pos) {
+			captureValue := qsCaptureValue(w.pos, move)
+			futilityBase := standPat + 351 // Stockfish constant
+
+			// Delta pruning: skip if even this capture can't reach alpha
+			if standPat+captureValue+200 < alpha && !move.IsPromotion() {
+				if captureValue+futilityBase > bestValue {
+					bestValue = captureValue + futilityBase
 				}
+				continue
 			}
-			if move.IsPromotion() {
-				captureValue += QueenValue - PawnValue
+
+			// SEE pruning: skip losing captures
+			seeValue := SEE(w.pos, move)
+			if seeValue < 0 {
+				continue
 			}
-			if standPat+captureValue+200 < alpha {
+
+			// SEE futility: if base + SEE can't reach alpha, skip
+			if futilityBase+seeValue <= alpha {
+				if futilityBase > bestValue {
+					bestValue = futilityBase
+				}
 				continue
 			}
 		}
 
-		w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
+		w.computeDirtyPieces(move)
 		w.nnuePush()
 		undo := w.pos.MakeMove(move)
 		if !undo.Valid {
-			// Move is illegal - undo and try next move
 			w.pos.UnmakeMove(move, undo)
 			w.nnuePop()
 			continue
@@ -1072,57 +1133,53 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 		w.pos.UnmakeMove(move, undo)
 		w.nnuePop()
 
-		if score >= beta {
-			return beta
-		}
-
-		if score > alpha {
-			alpha = score
-		}
-	}
-
-	// At first ply of quiescence, also search check-giving moves
-	if qPly == 0 && !w.pos.InCheck() {
-		checkMoves := w.pos.GenerateChecks()
-
-		for i := 0; i < checkMoves.Len(); i++ {
-			move := checkMoves.Get(i)
-
-			if move.IsCapture(w.pos) {
-				continue
-			}
-
-			w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
-			w.nnuePush()
-			undo := w.pos.MakeMove(move)
-			if !undo.Valid {
-				// Move is illegal - undo and try next move
-				w.pos.UnmakeMove(move, undo)
-				w.nnuePop()
-				continue
-			}
-
-			if !w.pos.InCheck() {
-				w.pos.UnmakeMove(move, undo)
-				w.nnuePop()
-				continue
-			}
-
-			score := -w.quiescenceInternal(ply+1, qPly+1, -beta, -alpha)
-			w.pos.UnmakeMove(move, undo)
-			w.nnuePop()
-
-			if score >= beta {
-				return beta
-			}
+		if score > bestValue {
+			bestValue = score
+			bestMove = move
 
 			if score > alpha {
 				alpha = score
+				if score >= beta {
+					break // Beta cutoff
+				}
 			}
 		}
 	}
 
-	return alpha
+	// Checkmate detection: if in check and no legal moves found
+	if inCheck && bestValue == -MateScore+ply {
+		return -MateScore + ply // Checkmate
+	}
+
+	// Store result in TT
+	var ttFlag TTFlag
+	if bestValue >= beta {
+		ttFlag = TTLowerBound
+	} else if bestValue > originalAlpha {
+		ttFlag = TTExact
+	} else {
+		ttFlag = TTUpperBound
+	}
+	w.tt.Store(w.pos.Hash, 0, AdjustScoreToTT(bestValue, ply), ttFlag, bestMove, false)
+
+	return bestValue
+}
+
+// qsCaptureValue returns the material value of a capture for QS pruning.
+func qsCaptureValue(pos *board.Position, move board.Move) int {
+	var value int
+	if move.IsEnPassant() {
+		value = PawnValue
+	} else {
+		captured := pos.PieceAt(move.To())
+		if captured != board.NoPiece {
+			value = pieceValues[captured.Type()]
+		}
+	}
+	if move.IsPromotion() {
+		value += pieceValues[move.Promotion()] - PawnValue
+	}
+	return value
 }
 
 // detectSeriousThreats checks if opponent has serious threats against our pieces.
