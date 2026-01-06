@@ -6,6 +6,28 @@ import (
 	"github.com/hailam/chessplay/sfnnue/features"
 )
 
+// DirtyPiece tracks a piece change for incremental accumulator updates.
+// FromSq = -1 means piece was added (not moved from anywhere).
+// ToSq = -1 means piece was removed (captured).
+type DirtyPiece struct {
+	Piece  int // sfnnue piece encoding (1-14)
+	FromSq int // source square (-1 if added)
+	ToSq   int // destination square (-1 if removed)
+}
+
+// MaxDirtyPieces is the maximum number of dirty pieces per move.
+// Normal move: 1, capture: 2, en passant: 2, promotion+capture: 3
+const MaxDirtyPieces = 3
+
+// DirtyState tracks piece changes for incremental NNUE updates.
+type DirtyState struct {
+	Pieces     [MaxDirtyPieces]DirtyPiece
+	Count      int
+	KingMoved  [2]bool // Whether king moved for each perspective
+	KingSq     [2]int  // King squares after move
+	Computed   bool    // Whether dirty state has been computed
+}
+
 // sfnnuePieceTable maps [color][pieceType] to sfnnue piece encoding.
 // board types: Pawn=0, Knight=1, Bishop=2, Rook=3, Queen=4, King=5
 // sfnnue types: W_PAWN=1, W_KNIGHT=2, ..., B_PAWN=9, B_KNIGHT=10, ...
@@ -87,6 +109,151 @@ func countPieces(pos *board.Position) int {
 	return count
 }
 
+// computeDirtyPieces computes NNUE feature changes for a move.
+// Must be called BEFORE MakeMove while position still has original state.
+// Returns true if incremental update is possible (no king moves for either perspective).
+func (w *Worker) computeDirtyPieces(m board.Move) bool {
+	if !w.useNNUE || w.nnueAcc == nil {
+		return false
+	}
+
+	// Reset dirty state
+	w.dirtyState.Count = 0
+	w.dirtyState.KingMoved[0] = false
+	w.dirtyState.KingMoved[1] = false
+	w.dirtyState.Computed = false
+
+	pos := w.pos
+	from := m.From()
+	to := m.To()
+	movingPiece := pos.PieceAt(from)
+
+	if movingPiece == board.NoPiece {
+		return false
+	}
+
+	us := int(movingPiece.Color())
+	pt := movingPiece.Type()
+	sfPiece := sfnnuePieceTable[us][pt]
+
+	// Store current king squares (before the move)
+	w.dirtyState.KingSq[0] = int(pos.KingSquare[board.White])
+	w.dirtyState.KingSq[1] = int(pos.KingSquare[board.Black])
+
+	// Check for king move - requires full refresh for that perspective
+	if pt == board.King {
+		w.dirtyState.KingMoved[us] = true
+		// Update king square for after the move
+		w.dirtyState.KingSq[us] = int(to)
+		w.dirtyState.Computed = true
+		return false // Can't do incremental for king moves
+	}
+
+	// Handle castling - king is moving
+	if m.IsCastling() {
+		w.dirtyState.KingMoved[us] = true
+		w.dirtyState.KingSq[us] = int(to)
+		w.dirtyState.Computed = true
+		return false
+	}
+
+	// Record the moving piece: removed from 'from', added to 'to'
+	w.dirtyState.Pieces[w.dirtyState.Count] = DirtyPiece{
+		Piece:  sfPiece,
+		FromSq: int(from),
+		ToSq:   int(to),
+	}
+	w.dirtyState.Count++
+
+	// Handle captures
+	if m.IsEnPassant() {
+		// En passant: captured pawn is on a different square
+		var capturedSq board.Square
+		if us == int(board.White) {
+			capturedSq = to - 8
+		} else {
+			capturedSq = to + 8
+		}
+		capturedColor := 1 - us
+		capturedSfPiece := sfnnuePieceTable[capturedColor][board.Pawn]
+		w.dirtyState.Pieces[w.dirtyState.Count] = DirtyPiece{
+			Piece:  capturedSfPiece,
+			FromSq: int(capturedSq),
+			ToSq:   -1, // Removed
+		}
+		w.dirtyState.Count++
+	} else {
+		// Regular capture
+		capturedPiece := pos.PieceAt(to)
+		if capturedPiece != board.NoPiece {
+			capturedColor := int(capturedPiece.Color())
+			capturedPt := capturedPiece.Type()
+			capturedSfPiece := sfnnuePieceTable[capturedColor][capturedPt]
+			w.dirtyState.Pieces[w.dirtyState.Count] = DirtyPiece{
+				Piece:  capturedSfPiece,
+				FromSq: int(to),
+				ToSq:   -1, // Removed
+			}
+			w.dirtyState.Count++
+		}
+	}
+
+	// Handle promotions
+	if m.IsPromotion() {
+		promoPt := m.Promotion()
+		promoSfPiece := sfnnuePieceTable[us][promoPt]
+
+		// The pawn move was already recorded, but we need to fix it:
+		// Pawn is removed from 'from', promoted piece appears at 'to'
+		// So change the first dirty piece to be pawn removed, add promoted piece added
+		w.dirtyState.Pieces[0] = DirtyPiece{
+			Piece:  sfPiece, // Pawn
+			FromSq: int(from),
+			ToSq:   -1, // Removed
+		}
+		// Add promoted piece
+		w.dirtyState.Pieces[w.dirtyState.Count] = DirtyPiece{
+			Piece:  promoSfPiece,
+			FromSq: -1, // Added (not moved from anywhere)
+			ToSq:   int(to),
+		}
+		w.dirtyState.Count++
+	}
+
+	w.dirtyState.Computed = true
+	return true
+}
+
+// computeFeatureDeltas computes removed and added feature indices for incremental update.
+// Returns slices into pre-allocated buffers.
+func (w *Worker) computeFeatureDeltas(perspective, ksq int) (removed, added []int) {
+	// Use activeIndicesBuffer split in half: first 32 for removed, second 32 for added
+	removedBuf := w.activeIndicesBuffer[0:32]
+	addedBuf := w.activeIndicesBuffer[32:64]
+	removedCount := 0
+	addedCount := 0
+
+	for i := 0; i < w.dirtyState.Count; i++ {
+		dp := &w.dirtyState.Pieces[i]
+
+		if dp.FromSq >= 0 {
+			// Piece removed from FromSq
+			idx := features.MakeIndex(perspective, dp.FromSq, dp.Piece, ksq)
+			removedBuf[removedCount] = idx
+			removedCount++
+		}
+
+		if dp.ToSq >= 0 {
+			// Piece added to ToSq
+			idx := features.MakeIndex(perspective, dp.ToSq, dp.Piece, ksq)
+			addedBuf[addedCount] = idx
+			addedCount++
+		}
+	}
+
+	return removedBuf[:removedCount], addedBuf[:addedCount]
+}
+
 // nnueEvaluate performs NNUE evaluation for the worker's position.
 func (w *Worker) nnueEvaluate() int {
 	if w.nnueNet == nil || w.nnueAcc == nil {
@@ -95,17 +262,66 @@ func (w *Worker) nnueEvaluate() int {
 
 	pieceCount := countPieces(w.pos)
 
-	// Get current accumulators
+	// Get current and previous accumulators
 	bigAcc := w.nnueAcc.CurrentBig()
 	smallAcc := w.nnueAcc.CurrentSmall()
+	prevBig := w.nnueAcc.PreviousBig()
+	prevSmall := w.nnueAcc.PreviousSmall()
 
-	// Recompute accumulators if needed (use pre-allocated buffer for active indices)
+	// Update or recompute accumulators for each perspective
 	for perspective := 0; perspective < 2; perspective++ {
-		if !bigAcc.Computed[perspective] {
-			computeAccumulator(w.nnueNet.Big, w.pos, bigAcc, perspective, w.activeIndicesBuffer[:])
+		// Check if already computed (rare - only at root or after full refresh)
+		if bigAcc.Computed[perspective] && smallAcc.Computed[perspective] {
+			continue
 		}
-		if !smallAcc.Computed[perspective] {
-			computeAccumulator(w.nnueNet.Small, w.pos, smallAcc, perspective, w.activeIndicesBuffer[:])
+
+		// Check if we can do incremental update:
+		// 1. Have a previous accumulator
+		// 2. Previous was computed for this perspective
+		// 3. No king move for this perspective (NeedsRefresh is false)
+		// 4. Dirty state was computed with changes
+		canIncremental := prevBig != nil && prevSmall != nil &&
+			prevBig.Computed[perspective] && prevSmall.Computed[perspective] &&
+			!bigAcc.NeedsRefresh[perspective] &&
+			w.dirtyState.Computed && w.dirtyState.Count > 0
+
+		if canIncremental {
+			// Incremental update: only process changed features
+			// Note: Push() already copied parent accumulators to current level,
+			// so we just need to apply the delta with UpdateAccumulator directly
+			// (no need for ForwardUpdateIncremental which would copy again)
+			ksq := int(w.pos.KingSquare[perspective])
+			removed, added := w.computeFeatureDeltas(perspective, ksq)
+
+			// Apply incremental update to big network
+			if !bigAcc.Computed[perspective] {
+				w.nnueNet.Big.FeatureTransformer.UpdateAccumulator(
+					removed, added,
+					bigAcc.Accumulation[perspective],
+					bigAcc.PSQTAccumulation[perspective],
+				)
+				bigAcc.Computed[perspective] = true
+				bigAcc.KingSq[perspective] = ksq
+			}
+
+			// Apply incremental update to small network
+			if !smallAcc.Computed[perspective] {
+				w.nnueNet.Small.FeatureTransformer.UpdateAccumulator(
+					removed, added,
+					smallAcc.Accumulation[perspective],
+					smallAcc.PSQTAccumulation[perspective],
+				)
+				smallAcc.Computed[perspective] = true
+				smallAcc.KingSq[perspective] = ksq
+			}
+		} else {
+			// Full recomputation required (king moved, no previous, or root)
+			if !bigAcc.Computed[perspective] {
+				computeAccumulator(w.nnueNet.Big, w.pos, bigAcc, perspective, w.activeIndicesBuffer[:])
+			}
+			if !smallAcc.Computed[perspective] {
+				computeAccumulator(w.nnueNet.Small, w.pos, smallAcc, perspective, w.activeIndicesBuffer[:])
+			}
 		}
 	}
 
@@ -174,16 +390,49 @@ func (w *Worker) resetNNUEAccumulators() {
 }
 
 // nnuePush saves accumulator state before making a move.
+// The dirty pieces should already be computed via computeDirtyPieces().
+// Push() copies parent accumulators to current level.
+// We only set NeedsRefresh for perspectives where the king moved.
 func (w *Worker) nnuePush() {
 	if w.useNNUE && w.nnueAcc != nil {
 		w.nnueAcc.Push()
-		// Mark new level as needing recomputation
+
+		// Get current accumulators (copied from parent by Push)
 		bigAcc := w.nnueAcc.CurrentBig()
 		smallAcc := w.nnueAcc.CurrentSmall()
-		bigAcc.Computed[0] = false
-		bigAcc.Computed[1] = false
-		smallAcc.Computed[0] = false
-		smallAcc.Computed[1] = false
+
+		// Set NeedsRefresh based on dirty state
+		// If dirty state not computed (null move or edge case), require full refresh
+		if !w.dirtyState.Computed {
+			bigAcc.NeedsRefresh[0] = true
+			bigAcc.NeedsRefresh[1] = true
+			smallAcc.NeedsRefresh[0] = true
+			smallAcc.NeedsRefresh[1] = true
+			// Also mark as not computed to force full recomputation
+			bigAcc.Computed[0] = false
+			bigAcc.Computed[1] = false
+			smallAcc.Computed[0] = false
+			smallAcc.Computed[1] = false
+		} else {
+			// Only set NeedsRefresh for perspectives where king moved
+			for p := 0; p < 2; p++ {
+				if w.dirtyState.KingMoved[p] {
+					bigAcc.NeedsRefresh[p] = true
+					smallAcc.NeedsRefresh[p] = true
+					// King moved - mark as not computed for this perspective
+					bigAcc.Computed[p] = false
+					smallAcc.Computed[p] = false
+				} else {
+					// No king move - can do incremental update
+					bigAcc.NeedsRefresh[p] = false
+					smallAcc.NeedsRefresh[p] = false
+					// Mark as NOT computed - the values are inherited from parent
+					// but need incremental update to be valid for this position
+					bigAcc.Computed[p] = false
+					smallAcc.Computed[p] = false
+				}
+			}
+		}
 	}
 }
 

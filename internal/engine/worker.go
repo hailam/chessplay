@@ -89,6 +89,9 @@ type Worker struct {
 	// Max 32 pieces on the board, but features can have more indices due to king-relative positions
 	activeIndicesBuffer [64]int
 
+	// Dirty piece tracking for incremental NNUE updates
+	dirtyState DirtyState
+
 	// Tablebase probing
 	tbProber   tablebase.Prober
 	tbProbeDepth int // Minimum depth to probe TB (default: 1)
@@ -545,6 +548,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				continue
 			}
 
+			w.computeDirtyPieces(capture) // Track piece changes for incremental NNUE
 			w.nnuePush()
 			undo := w.pos.MakeMove(capture)
 			if !undo.Valid {
@@ -580,6 +584,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			PickMove(mcMoves, mcScores, i)
 			move := mcMoves.Get(i)
 
+			w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
 			w.nnuePush()
 			undo := w.pos.MakeMove(move)
 			if !undo.Valid {
@@ -756,6 +761,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			}
 		}
 
+		w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
 		w.nnuePush()
 		w.undoStack[ply] = w.pos.MakeMove(move)
 		if !w.undoStack[ply].Valid {
@@ -1052,6 +1058,7 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 			}
 		}
 
+		w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
 		w.nnuePush()
 		undo := w.pos.MakeMove(move)
 		if !undo.Valid {
@@ -1085,6 +1092,7 @@ func (w *Worker) quiescenceInternal(ply, qPly int, alpha, beta int) int {
 				continue
 			}
 
+			w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
 			w.nnuePush()
 			undo := w.pos.MakeMove(move)
 			if !undo.Valid {
