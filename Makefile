@@ -16,7 +16,7 @@ CLI_SOURCES=src/bitboard.c src/gen.c src/position.c src/str.c src/util.c src/vec
             src/engine.c src/game.c src/jobs.c src/main.c src/openings.c src/options.c \
             src/seqwriter.c src/sprt.c src/workers.c
 
-.PHONY: deps build uci build-amd64-uci gen-pprof test-elo clean
+.PHONY: deps build uci build-amd64-uci gen-pprof test-elo profile-elo clean
 
 # 1. Dependency Management
 deps:
@@ -67,10 +67,34 @@ test-elo: uci
 	$(CHESS_CLI) \
 		-each tc=13+0.1 \
 		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go \
-		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=5 \
+		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=20 \
 		-concurrency 2 \
-		-rounds 5 \
+		-rounds 100 \
 		-pgn results.pgn
 
+# 7. Profile during Elo Testing
+# Runs with profiling enabled via UCI option to identify hot paths
+PROFILE_OUTPUT=$(shell pwd)/elo_profile.pprof
+profile-elo: uci
+	rm -f results.pgn $(PROFILE_OUTPUT)
+	@echo "Starting profiled Elo benchmark (concurrency=1 for accurate profiling)..."
+	@echo "Profile will be saved to: $(PROFILE_OUTPUT)"
+	$(CHESS_CLI) \
+		-each tc=10+0.1 \
+		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go option.cpuprofile=$(PROFILE_OUTPUT) \
+		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=4 \
+		-concurrency 1 \
+		-rounds 4 \
+		-pgn results.pgn
+	@echo ""
+	@echo "=== CPU Profile Summary ==="
+	@if [ -f $(PROFILE_OUTPUT) ]; then \
+		go tool pprof -top -cum $(PROFILE_OUTPUT) 2>/dev/null | head -40; \
+		echo ""; \
+		echo "For interactive analysis: go tool pprof -http=:8080 $(PROFILE_OUTPUT)"; \
+	else \
+		echo "Profile not generated - engine may not have exited cleanly"; \
+	fi
+
 clean:
-	rm -rf ./bin $(PROFILE) results.pgn
+	rm -rf ./bin $(PROFILE) $(PROFILE_OUTPUT) results.pgn

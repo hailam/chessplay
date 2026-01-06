@@ -77,6 +77,10 @@ type AccumulatorStack struct {
 
 	// Current stack size
 	Size int
+
+	// Pre-allocated buffer for transformed features (avoids allocation per eval)
+	// Max size is TransformedFeatureDimensionsBig (1024)
+	TransformBuffer [1024]uint8
 }
 
 // MaxStackSize is the maximum ply depth

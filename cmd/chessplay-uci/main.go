@@ -1,9 +1,11 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 
 	"github.com/hailam/chessplay/internal/engine"
 	"github.com/hailam/chessplay/internal/uci"
@@ -15,7 +17,29 @@ const (
 	defaultSmallNet = "nn-37f18f62d772.nnue" // ~3.5MB
 )
 
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
 func main() {
+	flag.Parse()
+
+	// Start CPU profiling if requested (via flag or environment variable)
+	profilePath := *cpuprofile
+	if profilePath == "" {
+		profilePath = os.Getenv("CPUPROFILE")
+	}
+	if profilePath != "" {
+		f, err := os.Create(profilePath)
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+		log.Printf("CPU profiling enabled, writing to %s", profilePath)
+	}
+
 	// Create engine with 64MB hash table
 	// Multi-threaded search enabled (Lazy SMP)
 	eng := engine.NewEngine(64)

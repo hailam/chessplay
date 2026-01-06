@@ -9,6 +9,8 @@
 
 package sfnnue
 
+import "unsafe"
+
 // SIMDAddInt16 adds weights to accumulator (scalar fallback).
 // dst[i] += src[i] for all i in range
 func SIMDAddInt16(dst, src []int16) {
@@ -88,4 +90,34 @@ func SIMDClippedReLU(input []int32, output []uint8, shift int) {
 		}
 		output[i] = uint8(val)
 	}
+}
+
+// SIMDTransformClampMul performs the fused Transform inner loop (scalar fallback).
+// Computes: output[i] = uint8((clamp(acc0[i], 0, maxVal) * clamp(acc1[i], 0, maxVal)) >> 9)
+func SIMDTransformClampMul(acc0, acc1 []int16, output []uint8, maxVal int) {
+	maxVal16 := int16(maxVal)
+	for i := range acc0 {
+		sum0 := acc0[i]
+		sum1 := acc1[i]
+
+		// Clamp to [0, maxVal]
+		if sum0 < 0 {
+			sum0 = 0
+		} else if sum0 > maxVal16 {
+			sum0 = maxVal16
+		}
+		if sum1 < 0 {
+			sum1 = 0
+		} else if sum1 > maxVal16 {
+			sum1 = maxVal16
+		}
+
+		// Multiply and divide by 512
+		output[i] = uint8((int(sum0) * int(sum1)) >> 9)
+	}
+}
+
+// PrefetchLines is a no-op on scalar platforms.
+func PrefetchLines(addr unsafe.Pointer, count int) {
+	// No prefetch support on scalar fallback
 }

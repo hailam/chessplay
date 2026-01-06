@@ -550,3 +550,118 @@ crelu_scalar_loop:
 
 crelu_done:
 	RET
+
+// ============================================================================
+// FUSED TRANSFORM: clamp + pairwise multiply + shift (for FeatureTransformer)
+// ============================================================================
+// This fuses the inner loop of Transform:
+//   output[j] = uint8((clamp(acc0[j]) * clamp(acc1[j])) >> 9)
+// Processes 8 elements per iteration.
+//
+// func neonTransformClampMul(acc0, acc1, output unsafe.Pointer, count, maxVal int)
+// acc0: first half of accumulation (int16)
+// acc1: second half of accumulation (int16), offset by halfHalfDims
+// output: destination (uint8)
+// count: number of elements to process (should be multiple of 8)
+// maxVal: clamp max value (255 for big network, 254 for small)
+TEXT ·neonTransformClampMul(SB), NOSPLIT, $0-40
+	MOVD  acc0+0(FP), R0        // acc0 pointer (int16)
+	MOVD  acc1+8(FP), R1        // acc1 pointer (int16)
+	MOVD  output+16(FP), R2     // output pointer (uint8)
+	MOVD  count+24(FP), R3      // count
+	MOVD  maxVal+32(FP), R4     // max value for clamp
+
+	// Check if we have at least 8 elements
+	CMP   $8, R3
+	BLT   tcm_scalar
+
+	// Create vector constants
+	// v30 = zero vector for lower clamp
+	WORD  $0x6E3E1FDE           // eor v30.16b, v30.16b, v30.16b
+	// v31 = maxVal vector for upper clamp (broadcast int16)
+	WORD  $0x4E020C9F           // dup v31.8h, w4
+
+tcm_loop8:
+	CMP   $8, R3
+	BLT   tcm_scalar
+
+	// Load 8 int16 from acc0: ld1 {v0.8h}, [x0]
+	WORD  $0x4C407400           // ld1 {v0.8h}, [x0]
+	// Load 8 int16 from acc1: ld1 {v1.8h}, [x1]
+	WORD  $0x4C407421           // ld1 {v1.8h}, [x1]
+
+	// Clamp acc0 to [0, maxVal]
+	// smax v0.8h, v0.8h, v30.8h (clamp lower to 0)
+	WORD  $0x4E7E6400           // smax v0.8h, v0.8h, v30.8h
+	// smin v0.8h, v0.8h, v31.8h (clamp upper to maxVal)
+	WORD  $0x4E7F6C00           // smin v0.8h, v0.8h, v31.8h
+
+	// Clamp acc1 to [0, maxVal]
+	// smax v1.8h, v1.8h, v30.8h
+	WORD  $0x4E7E6421           // smax v1.8h, v1.8h, v30.8h
+	// smin v1.8h, v1.8h, v31.8h
+	WORD  $0x4E7F6C21           // smin v1.8h, v1.8h, v31.8h
+
+	// Multiply and widen: smull v2.4s, v0.4h, v1.4h (low 4)
+	WORD  $0x0E61C002           // smull v2.4s, v0.4h, v1.4h
+	// smull2 v3.4s, v0.8h, v1.8h (high 4)
+	WORD  $0x4E61C003           // smull2 v3.4s, v0.8h, v1.8h
+
+	// Right shift by 9 (divide by 512)
+	// sshr v2.4s, v2.4s, #9
+	WORD  $0x4F370442           // sshr v2.4s, v2.4s, #9
+	// sshr v3.4s, v3.4s, #9
+	WORD  $0x4F370463           // sshr v3.4s, v3.4s, #9
+
+	// Narrow to int16: sqxtn v4.4h, v2.4s (saturating narrow)
+	WORD  $0x0EA14844           // sqxtn v4.4h, v2.4s
+	// sqxtn2 v4.8h, v3.4s (narrow high part)
+	WORD  $0x4EA14864           // sqxtn2 v4.8h, v3.4s
+
+	// Narrow to uint8: sqxtun v4.8b, v4.8h (unsigned saturating narrow)
+	WORD  $0x2E212884           // sqxtun v4.8b, v4.8h
+
+	// Store 8 bytes: st1 {v4.8b}, [x2]
+	WORD  $0x0C007044           // st1 {v4.8b}, [x2]
+
+	ADD   $16, R0               // advance acc0 by 16 bytes (8 x int16)
+	ADD   $16, R1               // advance acc1 by 16 bytes
+	ADD   $8, R2                // advance output by 8 bytes
+	SUB   $8, R3, R3
+	B     tcm_loop8
+
+tcm_scalar:
+	CBZ   R3, tcm_done
+	MOVW  $0, R5                // zero for lower clamp
+
+tcm_scalar_loop:
+	// Load int16 values
+	MOVH  (R0), R6              // load acc0 (sign extends to 64-bit)
+	MOVH  (R1), R7              // load acc1
+
+	// Clamp acc0 to [0, maxVal]
+	CMP   R5, R6
+	CSEL  LT, R5, R6, R6        // if R6 < 0, R6 = 0
+	CMP   R4, R6
+	CSEL  GT, R4, R6, R6        // if R6 > maxVal, R6 = maxVal
+
+	// Clamp acc1 to [0, maxVal]
+	CMP   R5, R7
+	CSEL  LT, R5, R7, R7
+	CMP   R4, R7
+	CSEL  GT, R4, R7, R7
+
+	// Multiply and shift right by 9
+	MULW  R6, R7, R6
+	ASRW  $9, R6, R6
+
+	// Store result
+	MOVB  R6, (R2)
+	ADD   $2, R0
+	ADD   $2, R1
+	ADD   $1, R2
+	SUB   $1, R3, R3
+	CBNZ  R3, tcm_scalar_loop
+
+tcm_done:
+	RET

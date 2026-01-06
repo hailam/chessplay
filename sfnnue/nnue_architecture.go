@@ -36,6 +36,17 @@ const (
 	ThreatInputDimensions = features.ThreatDimensions // 79856
 )
 
+// ForwardBuffers holds pre-allocated buffers for the forward pass.
+// Avoids allocation per Propagate call.
+type ForwardBuffers struct {
+	FC0Out    [32]int32 // CeilToMultiple(FC0Outputs, 32)
+	AcSqr0Out [64]uint8 // CeilToMultiple(FC0Outputs*2, 32) - holds both sqr and regular
+	Ac0Out    [32]uint8 // CeilToMultiple(FC0Outputs, 32)
+	FC1Out    [32]int32 // CeilToMultiple(FC1Outputs, 32)
+	Ac1Out    [32]uint8 // CeilToMultiple(FC1Outputs, 32)
+	FC2Out    [32]int32 // CeilToMultiple(1, 32)
+}
+
 // NetworkArchitecture represents the neural network structure.
 // Ported from nnue_architecture.h:60-153
 type NetworkArchitecture struct {
@@ -50,6 +61,9 @@ type NetworkArchitecture struct {
 	FC1    *layers.AffineTransform            // FC0Outputs*2 -> FC1Outputs
 	Ac1    *layers.ClippedReLU                // FC1Outputs
 	FC2    *layers.AffineTransform            // FC1Outputs -> 1
+
+	// Pre-allocated buffers for forward pass (avoids allocation per Propagate)
+	buffers ForwardBuffers
 }
 
 // NewBigNetworkArchitecture creates the big network architecture
@@ -124,15 +138,16 @@ func (n *NetworkArchitecture) ReadParameters(r io.Reader) error {
 }
 
 // Propagate performs the forward pass through all layers.
+// Uses pre-allocated buffers to avoid allocation per call.
 // Ported from nnue_architecture.h:102-139
 func (n *NetworkArchitecture) Propagate(transformedFeatures []uint8) int32 {
-	// Allocate buffers
-	fc0Out := make([]int32, CeilToMultiple(n.FC0Outputs, 32))
-	acSqr0Out := make([]uint8, CeilToMultiple(n.FC0Outputs*2, 32))
-	ac0Out := make([]uint8, CeilToMultiple(n.FC0Outputs, 32))
-	fc1Out := make([]int32, CeilToMultiple(n.FC1Outputs, 32))
-	ac1Out := make([]uint8, CeilToMultiple(n.FC1Outputs, 32))
-	fc2Out := make([]int32, CeilToMultiple(1, 32))
+	// Use pre-allocated buffers (sliced to required size)
+	fc0Out := n.buffers.FC0Out[:CeilToMultiple(n.FC0Outputs, 32)]
+	acSqr0Out := n.buffers.AcSqr0Out[:CeilToMultiple(n.FC0Outputs*2, 32)]
+	ac0Out := n.buffers.Ac0Out[:CeilToMultiple(n.FC0Outputs, 32)]
+	fc1Out := n.buffers.FC1Out[:CeilToMultiple(n.FC1Outputs, 32)]
+	ac1Out := n.buffers.Ac1Out[:CeilToMultiple(n.FC1Outputs, 32)]
+	fc2Out := n.buffers.FC2Out[:CeilToMultiple(1, 32)]
 
 	// Forward pass
 	n.FC0.Propagate(transformedFeatures, fc0Out)

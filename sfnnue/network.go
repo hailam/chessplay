@@ -183,12 +183,15 @@ func (n *Network) readParameters(r io.Reader) error {
 }
 
 // Evaluate evaluates a position using the network.
+// transformBuffer should be pre-allocated by the caller (per-worker) to avoid allocation.
+// If nil, a temporary buffer will be allocated.
 // Ported from network.cpp:172-189
 func (n *Network) Evaluate(
 	accumulation [2][]int16,
 	psqtAccumulation [2][]int32,
 	sideToMove int,
 	pieceCount int,
+	transformBuffer []uint8,
 ) (psqt int32, positional int32) {
 	// Select bucket based on piece count
 	bucket := (pieceCount - 1) / 4
@@ -201,9 +204,14 @@ func (n *Network) Evaluate(
 	// Determine perspectives
 	perspectives := [2]int{sideToMove, 1 - sideToMove}
 
-	// Transform features
+	// Transform features - use provided buffer or allocate
 	halfDims := n.FeatureTransformer.HalfDimensions
-	transformedFeatures := make([]uint8, halfDims)
+	var transformedFeatures []uint8
+	if transformBuffer != nil && len(transformBuffer) >= halfDims {
+		transformedFeatures = transformBuffer[:halfDims]
+	} else {
+		transformedFeatures = make([]uint8, halfDims)
+	}
 
 	psqt = n.FeatureTransformer.Transform(
 		accumulation,

@@ -64,6 +64,9 @@ func neonDotProductInt8Uint8(weights, inputs unsafe.Pointer, count int) int32
 //go:noescape
 func neonClippedReLU(input, output unsafe.Pointer, count, shift int)
 
+//go:noescape
+func neonTransformClampMul(acc0, acc1, output unsafe.Pointer, count, maxVal int)
+
 // PrefetchL1 prefetches memory at addr into L1 cache.
 func PrefetchL1(addr unsafe.Pointer) {
 	prefetchL1(addr)
@@ -313,4 +316,22 @@ func SIMDClippedReLU(input []int32, output []uint8, shift int) {
 		count = len(output)
 	}
 	neonClippedReLU(unsafe.Pointer(&input[0]), unsafe.Pointer(&output[0]), count, shift)
+}
+
+// SIMDTransformClampMul performs the fused Transform inner loop using ARM64 NEON.
+// Computes: output[i] = uint8((clamp(acc0[i], 0, maxVal) * clamp(acc1[i], 0, maxVal)) >> 9)
+// acc0 and acc1 are the two halves of the accumulation array.
+// This fuses clamp + multiply + shift into a single SIMD operation.
+func SIMDTransformClampMul(acc0, acc1 []int16, output []uint8, maxVal int) {
+	count := len(acc0)
+	if count == 0 {
+		return
+	}
+	if count > len(acc1) {
+		count = len(acc1)
+	}
+	if count > len(output) {
+		count = len(output)
+	}
+	neonTransformClampMul(unsafe.Pointer(&acc0[0]), unsafe.Pointer(&acc1[0]), unsafe.Pointer(&output[0]), count, maxVal)
 }

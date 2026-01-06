@@ -191,55 +191,28 @@ func (ft *FeatureTransformer) Transform(
 		psqt /= 2
 	}
 
-	// Apply pairwise multiplication with clipping
+	// Apply pairwise multiplication with clipping using fused SIMD operation
 	halfDims := ft.HalfDimensions
+	halfHalfDims := halfDims / 2
+
+	// Determine max value based on network type
+	maxVal := 255 // Big network with threats
+	if !ft.UseThreats {
+		maxVal = 254 // Small network (127 * 2)
+	}
+
 	for p := 0; p < 2; p++ {
-		offset := (halfDims / 2) * p
+		offset := halfHalfDims * p
 		acc := accumulation[perspectives[p]]
 
-		if ft.UseThreats {
-			maxVal := int16(255)
-			for j := 0; j < halfDims/2; j++ {
-				sum0 := acc[j]
-				sum1 := acc[j+halfDims/2]
-
-				// Clamp to [0, 255]
-				if sum0 < 0 {
-					sum0 = 0
-				} else if sum0 > maxVal {
-					sum0 = maxVal
-				}
-				if sum1 < 0 {
-					sum1 = 0
-				} else if sum1 > maxVal {
-					sum1 = maxVal
-				}
-
-				// Pairwise multiply and divide by 512
-				output[offset+j] = uint8((int(sum0) * int(sum1)) / 512)
-			}
-		} else {
-			maxVal := int16(127 * 2)
-			for j := 0; j < halfDims/2; j++ {
-				sum0 := acc[j]
-				sum1 := acc[j+halfDims/2]
-
-				// Clamp to [0, 254]
-				if sum0 < 0 {
-					sum0 = 0
-				} else if sum0 > maxVal {
-					sum0 = maxVal
-				}
-				if sum1 < 0 {
-					sum1 = 0
-				} else if sum1 > maxVal {
-					sum1 = maxVal
-				}
-
-				// Pairwise multiply and divide by 512
-				output[offset+j] = uint8((int(sum0) * int(sum1)) / 512)
-			}
-		}
+		// Use fused SIMD operation: clamp + multiply + shift in one pass
+		// acc0 = acc[0:halfHalfDims], acc1 = acc[halfHalfDims:halfDims]
+		SIMDTransformClampMul(
+			acc[:halfHalfDims],
+			acc[halfHalfDims:halfDims],
+			output[offset:offset+halfHalfDims],
+			maxVal,
+		)
 	}
 
 	return psqt
@@ -259,6 +232,11 @@ func (ft *FeatureTransformer) ComputeAccumulator(
 		psqtAccumulation[i] = 0
 	}
 
+	// BCE hint for PSQT accumulation array
+	if len(psqtAccumulation) >= PSQTBuckets {
+		_ = psqtAccumulation[PSQTBuckets-1]
+	}
+
 	// Add weights for active features (SIMD accelerated)
 	for _, idx := range activeIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
@@ -268,6 +246,8 @@ func (ft *FeatureTransformer) ComputeAccumulator(
 
 			// Add PSQT weights (small loop, not worth SIMD)
 			psqtOffset := idx * PSQTBuckets
+			// BCE hint for PSQT weights access
+			_ = ft.PSQTWeights[psqtOffset+PSQTBuckets-1]
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] += ft.PSQTWeights[psqtOffset+b]
 			}
@@ -289,6 +269,11 @@ func (ft *FeatureTransformer) UpdateAccumulator(
 		linesPerFeature = 1
 	}
 
+	// BCE hint for PSQT accumulation array
+	if len(psqtAccumulation) >= PSQTBuckets {
+		_ = psqtAccumulation[PSQTBuckets-1]
+	}
+
 	// Remove old features (SIMD accelerated)
 	for i, idx := range removedIndices {
 		if idx >= 0 && idx < ft.InputDimensions {
@@ -307,6 +292,8 @@ func (ft *FeatureTransformer) UpdateAccumulator(
 
 			// PSQT is only 8 elements, not worth SIMD
 			psqtOffset := idx * PSQTBuckets
+			// BCE hint for PSQT weights access
+			_ = ft.PSQTWeights[psqtOffset+PSQTBuckets-1]
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] -= ft.PSQTWeights[psqtOffset+b]
 			}
@@ -331,6 +318,8 @@ func (ft *FeatureTransformer) UpdateAccumulator(
 
 			// PSQT is only 8 elements, not worth SIMD
 			psqtOffset := idx * PSQTBuckets
+			// BCE hint for PSQT weights access
+			_ = ft.PSQTWeights[psqtOffset+PSQTBuckets-1]
 			for b := 0; b < PSQTBuckets; b++ {
 				psqtAccumulation[b] += ft.PSQTWeights[psqtOffset+b]
 			}
@@ -396,15 +385,19 @@ func (ft *FeatureTransformer) DoubleUpdateIncremental(
 	removed1, added1, removed2, added2 []int,
 	perspective int,
 ) {
-	// Combine both sets of changes
-	allRemoved := make([]int, 0, len(removed1)+len(removed2))
-	allRemoved = append(allRemoved, removed1...)
-	allRemoved = append(allRemoved, removed2...)
+	// Combine both sets of changes using stack-allocated arrays (no heap allocation)
+	var allRemovedBuf [16]int
+	var allAddedBuf [16]int
 
-	allAdded := make([]int, 0, len(added1)+len(added2))
-	allAdded = append(allAdded, added1...)
-	allAdded = append(allAdded, added2...)
+	removedLen := len(removed1) + len(removed2)
+	addedLen := len(added1) + len(added2)
+
+	// Copy to buffers
+	copy(allRemovedBuf[:len(removed1)], removed1)
+	copy(allRemovedBuf[len(removed1):removedLen], removed2)
+	copy(allAddedBuf[:len(added1)], added1)
+	copy(allAddedBuf[len(added1):addedLen], added2)
 
 	// Apply as single batch update
-	ft.ForwardUpdateIncremental(prevAcc, currAcc, allRemoved, allAdded, perspective)
+	ft.ForwardUpdateIncremental(prevAcc, currAcc, allRemovedBuf[:removedLen], allAddedBuf[:addedLen], perspective)
 }

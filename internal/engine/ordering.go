@@ -115,6 +115,10 @@ type MoveOrderer struct {
 	// Indexed by [prevPiece][prevTo] -> PieceToHistory table
 	// Used in LMR and move scoring for deeper pattern recognition
 	continuationHistory ContinuationHistory
+
+	// Pre-allocated buffer for move scores (avoids allocation per ScoreMoves call)
+	// Max 256 moves possible in any position (theoretical max ~218)
+	scoreBuffer [256]int
 }
 
 // NewMoveOrderer creates a new move orderer.
@@ -186,10 +190,12 @@ func (mo *MoveOrderer) Clear() {
 }
 
 // ScoreMoves assigns scores to moves for ordering.
+// Returns a slice backed by the internal scoreBuffer (no allocation).
 func (mo *MoveOrderer) ScoreMoves(pos *board.Position, moves *board.MoveList, ply int, ttMove board.Move) []int {
-	scores := make([]int, moves.Len())
+	n := moves.Len()
+	scores := mo.scoreBuffer[:n]
 
-	for i := 0; i < moves.Len(); i++ {
+	for i := 0; i < n; i++ {
 		move := moves.Get(i)
 		scores[i] = mo.scoreMove(pos, move, ply, ttMove)
 	}
@@ -198,8 +204,10 @@ func (mo *MoveOrderer) ScoreMoves(pos *board.Position, moves *board.MoveList, pl
 }
 
 // ScoreMovesWithCounter assigns scores including counter-move and CMH bonus.
+// Returns a slice backed by the internal scoreBuffer (no allocation).
 func (mo *MoveOrderer) ScoreMovesWithCounter(pos *board.Position, moves *board.MoveList, ply int, ttMove, prevMove board.Move) []int {
-	scores := make([]int, moves.Len())
+	n := moves.Len()
+	scores := mo.scoreBuffer[:n]
 	counterMove := mo.GetCounterMove(prevMove, pos)
 
 	// Get previous piece for CMH lookup

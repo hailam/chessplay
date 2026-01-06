@@ -64,8 +64,11 @@ type Worker struct {
 	searchStack [MaxPly]SearchStack // For continuation history tracking
 
 	// Per-worker position history for repetition detection
-	posHistory    []uint64
-	rootPosHashes []uint64
+	// Pre-allocated buffer avoids allocation per move in negamax
+	// Size: MaxPly (128) + 640 for root history = 768
+	posHistoryBuffer [768]uint64
+	posHistoryLen    int
+	rootPosHashes    []uint64
 
 	// Multi-PV support: moves to exclude at root
 	excludedRootMoves []board.Move
@@ -81,6 +84,10 @@ type Worker struct {
 	useNNUE  bool
 	nnueNet  *sfnnue.Networks
 	nnueAcc  *sfnnue.AccumulatorStack
+
+	// Pre-allocated buffer for active feature indices (avoids allocation per computeAccumulator call)
+	// Max 32 pieces on the board, but features can have more indices due to king-relative positions
+	activeIndicesBuffer [64]int
 
 	// Tablebase probing
 	tbProber   tablebase.Prober
@@ -177,10 +184,19 @@ func (w *Worker) InitSearch(pos *board.Position) {
 		w.nnueAcc.Reset()
 	}
 
-	// Initialize position history for this search
-	w.posHistory = make([]uint64, 0, len(w.rootPosHashes)+MaxPly)
-	w.posHistory = append(w.posHistory, w.rootPosHashes...)
-	w.posHistory = append(w.posHistory, w.pos.Hash)
+	// Initialize position history using pre-allocated buffer (avoids allocation per search)
+	// Copy root position hashes (game history) into buffer
+	rootLen := len(w.rootPosHashes)
+	if rootLen > 640 {
+		// Truncate to most recent 640 hashes (extremely long games)
+		rootLen = 640
+		copy(w.posHistoryBuffer[:rootLen], w.rootPosHashes[len(w.rootPosHashes)-640:])
+	} else {
+		copy(w.posHistoryBuffer[:rootLen], w.rootPosHashes)
+	}
+	// Add current position hash
+	w.posHistoryBuffer[rootLen] = w.pos.Hash
+	w.posHistoryLen = rootLen + 1
 }
 
 // Pos returns the current position (for debugging).
@@ -280,12 +296,12 @@ func (w *Worker) isDraw() bool {
 		return true
 	}
 
-	// Threefold repetition
-	if len(w.posHistory) > 0 {
+	// Threefold repetition (use pre-allocated buffer)
+	if w.posHistoryLen > 0 {
 		currentHash := w.pos.Hash
 		count := 0
-		for _, h := range w.posHistory {
-			if h == currentHash {
+		for i := 0; i < w.posHistoryLen; i++ {
+			if w.posHistoryBuffer[i] == currentHash {
 				count++
 				if count >= 2 {
 					return true
@@ -758,7 +774,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		w.searchStack[ply].moveTo = moveTo
 		w.searchStack[ply].continuationHistory = w.orderer.GetContinuationHistoryTable(movingPiece, moveTo)
 
-		w.posHistory = append(w.posHistory, w.pos.Hash)
+		w.posHistoryBuffer[w.posHistoryLen] = w.pos.Hash
+		w.posHistoryLen++
 		movesSearched++
 
 		var score int
@@ -838,7 +855,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			}
 		}
 
-		w.posHistory = w.posHistory[:len(w.posHistory)-1]
+		w.posHistoryLen--
 		w.pos.UnmakeMove(move, w.undoStack[ply])
 		w.nnuePop()
 

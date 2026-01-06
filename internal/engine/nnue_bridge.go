@@ -6,42 +6,74 @@ import (
 	"github.com/hailam/chessplay/sfnnue/features"
 )
 
-// positionAdapter wraps board.Position to implement sfnnue's features.Position interface.
-type positionAdapter struct {
-	pos *board.Position
+// sfnnuePieceTable maps [color][pieceType] to sfnnue piece encoding.
+// board types: Pawn=0, Knight=1, Bishop=2, Rook=3, Queen=4, King=5
+// sfnnue types: W_PAWN=1, W_KNIGHT=2, ..., B_PAWN=9, B_KNIGHT=10, ...
+var sfnnuePieceTable = [2][6]int{
+	{1, 2, 3, 4, 5, 6},    // White: W_PAWN=1, W_KNIGHT=2, etc.
+	{9, 10, 11, 12, 13, 14}, // Black: B_PAWN=9, B_KNIGHT=10, etc.
 }
 
-// KingSquare returns the king square for the given color.
-func (p *positionAdapter) KingSquare(color int) int {
-	return int(p.pos.KingSquare[color])
-}
+// appendActiveIndicesDirect computes active feature indices directly from board.Position,
+// avoiding interface dispatch and adapter allocation.
+// This is the hot path optimization for P3.
+func appendActiveIndicesDirect(perspective int, pos *board.Position, active *features.IndexList) {
+	ksq := int(pos.KingSquare[perspective])
 
-// PieceOn returns the piece at the given square in sfnnue format.
-// sfnnue piece format: W_PAWN=1, W_KNIGHT=2, ..., B_PAWN=9, B_KNIGHT=10, ...
-func (p *positionAdapter) PieceOn(sq int) int {
-	piece := p.pos.PieceAt(board.Square(sq))
-	if piece == board.NoPiece {
-		return features.NO_PIECE
+	// Iterate through all piece types and colors directly via bitboards.
+	// This avoids:
+	// 1. Interface dispatch overhead
+	// 2. The O(6) search in PieceAt() for each square
+	// 3. Adapter allocation
+	for c := 0; c < 2; c++ {
+		for pt := board.Pawn; pt <= board.King; pt++ {
+			sfPiece := sfnnuePieceTable[c][pt]
+			bb := uint64(pos.Pieces[c][pt])
+
+			// Process all squares with this piece type
+			for bb != 0 {
+				// Pop LSB
+				sq := trailingZeros64(bb)
+				bb &= bb - 1
+
+				// Compute feature index and add to list
+				active.Push(features.MakeIndex(perspective, sq, sfPiece, ksq))
+			}
+		}
 	}
-
-	// board.Piece encoding: color in upper bits, type in lower bits
-	pieceType := piece.Type()
-	pieceColor := piece.Color()
-
-	// Convert to sfnnue format: color * 8 + type
-	// board types: Pawn=0, Knight=1, Bishop=2, Rook=3, Queen=4, King=5
-	// sfnnue types: PAWN=1, KNIGHT=2, BISHOP=3, ROOK=4, QUEEN=5, KING=6
-	sfType := int(pieceType) + 1
-
-	if pieceColor == board.White {
-		return sfType // W_PAWN=1, W_KNIGHT=2, etc.
-	}
-	return sfType + 8 // B_PAWN=9, B_KNIGHT=10, etc.
 }
 
-// Pieces returns a bitboard of all pieces on the board.
-func (p *positionAdapter) Pieces() uint64 {
-	return uint64(p.pos.AllOccupied)
+// trailingZeros64 returns the number of trailing zero bits in x.
+// This is a hot path function, optimized for common cases.
+func trailingZeros64(x uint64) int {
+	if x == 0 {
+		return 64
+	}
+	n := 0
+	if x&0xFFFFFFFF == 0 {
+		n += 32
+		x >>= 32
+	}
+	if x&0xFFFF == 0 {
+		n += 16
+		x >>= 16
+	}
+	if x&0xFF == 0 {
+		n += 8
+		x >>= 8
+	}
+	if x&0xF == 0 {
+		n += 4
+		x >>= 4
+	}
+	if x&0x3 == 0 {
+		n += 2
+		x >>= 2
+	}
+	if x&0x1 == 0 {
+		n++
+	}
+	return n
 }
 
 // countPieces returns the total number of pieces on the board.
@@ -61,20 +93,19 @@ func (w *Worker) nnueEvaluate() int {
 		return EvaluateWithPawnTable(w.pos, w.pawnTable)
 	}
 
-	adapter := &positionAdapter{pos: w.pos}
 	pieceCount := countPieces(w.pos)
 
 	// Get current accumulators
 	bigAcc := w.nnueAcc.CurrentBig()
 	smallAcc := w.nnueAcc.CurrentSmall()
 
-	// Recompute accumulators if needed
+	// Recompute accumulators if needed (use pre-allocated buffer for active indices)
 	for perspective := 0; perspective < 2; perspective++ {
 		if !bigAcc.Computed[perspective] {
-			computeAccumulator(w.nnueNet.Big, adapter, bigAcc, perspective)
+			computeAccumulator(w.nnueNet.Big, w.pos, bigAcc, perspective, w.activeIndicesBuffer[:])
 		}
 		if !smallAcc.Computed[perspective] {
-			computeAccumulator(w.nnueNet.Small, adapter, smallAcc, perspective)
+			computeAccumulator(w.nnueNet.Small, w.pos, smallAcc, perspective, w.activeIndicesBuffer[:])
 		}
 	}
 
@@ -84,20 +115,22 @@ func (w *Worker) nnueEvaluate() int {
 		sideToMove = 1
 	}
 
-	// Big network evaluation
+	// Big network evaluation (use pre-allocated transform buffer from accumulator stack)
 	bigPsqt, bigPositional := w.nnueNet.Big.Evaluate(
 		bigAcc.Accumulation,
 		bigAcc.PSQTAccumulation,
 		sideToMove,
 		pieceCount,
+		w.nnueAcc.TransformBuffer[:],
 	)
 
-	// Small network evaluation (PSQT only)
+	// Small network evaluation (PSQT only, reuses same transform buffer)
 	smallPsqt, _ := w.nnueNet.Small.Evaluate(
 		smallAcc.Accumulation,
 		smallAcc.PSQTAccumulation,
 		sideToMove,
 		pieceCount,
+		w.nnueAcc.TransformBuffer[:],
 	)
 
 	// Combine: use big network's positional + small network's PSQT
@@ -108,13 +141,15 @@ func (w *Worker) nnueEvaluate() int {
 }
 
 // computeAccumulator computes the accumulator from scratch for a perspective.
-func computeAccumulator(net *sfnnue.Network, adapter *positionAdapter, acc *sfnnue.Accumulator, perspective int) {
-	// Get active feature indices
+// indexBuffer is a pre-allocated buffer to avoid allocation per call.
+// Uses direct bitboard iteration to avoid interface dispatch overhead (P3 optimization).
+func computeAccumulator(net *sfnnue.Network, pos *board.Position, acc *sfnnue.Accumulator, perspective int, indexBuffer []int) {
+	// Get active feature indices using direct function (avoids interface dispatch)
 	var activeList features.IndexList
-	features.AppendActiveIndices(perspective, adapter, &activeList)
+	appendActiveIndicesDirect(perspective, pos, &activeList)
 
-	// Convert to slice
-	activeIndices := make([]int, activeList.Size)
+	// Use pre-allocated buffer (slice to actual size)
+	activeIndices := indexBuffer[:activeList.Size]
 	for i := 0; i < activeList.Size; i++ {
 		activeIndices[i] = activeList.Values[i]
 	}
@@ -128,7 +163,7 @@ func computeAccumulator(net *sfnnue.Network, adapter *positionAdapter, acc *sfnn
 
 	// Mark as computed
 	acc.Computed[perspective] = true
-	acc.KingSq[perspective] = adapter.KingSquare(perspective)
+	acc.KingSq[perspective] = int(pos.KingSquare[perspective])
 }
 
 // resetNNUEAccumulators marks accumulators as needing recomputation.

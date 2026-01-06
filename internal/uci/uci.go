@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -35,6 +36,9 @@ type UCI struct {
 	searching     bool
 	searchDone    chan struct{}
 	stopRequested atomic.Bool
+
+	// CPU profiling
+	profileFile *os.File
 }
 
 // New creates a new UCI protocol handler.
@@ -536,6 +540,12 @@ func (u *UCI) handleStop() {
 // handleQuit exits the program.
 func (u *UCI) handleQuit() {
 	u.handleStop()
+	// Stop profiling if active
+	if u.profileFile != nil {
+		pprof.StopCPUProfile()
+		u.profileFile.Close()
+		fmt.Fprintf(os.Stderr, "info string CPU profile saved\n")
+	}
 	os.Exit(0)
 }
 
@@ -606,6 +616,29 @@ func (u *UCI) handleSetOption(args []string) {
 		board.DebugMoveValidation = enabled
 		if enabled {
 			fmt.Fprintf(os.Stderr, "info string Debug mode enabled\n")
+		}
+	case "cpuprofile":
+		// Stop existing profile if any
+		if u.profileFile != nil {
+			pprof.StopCPUProfile()
+			u.profileFile.Close()
+			fmt.Fprintf(os.Stderr, "info string CPU profile stopped\n")
+			u.profileFile = nil
+		}
+		// Start new profile if path provided
+		if value != "" && value != "stop" {
+			f, err := os.Create(value)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "info string Failed to create profile: %v\n", err)
+				return
+			}
+			if err := pprof.StartCPUProfile(f); err != nil {
+				f.Close()
+				fmt.Fprintf(os.Stderr, "info string Failed to start profile: %v\n", err)
+				return
+			}
+			u.profileFile = f
+			fmt.Fprintf(os.Stderr, "info string CPU profiling to %s\n", value)
 		}
 	}
 }

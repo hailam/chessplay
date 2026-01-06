@@ -24,3 +24,26 @@ func SIMDDotProductInt8Uint8(weights []int8, inputs []uint8, count int) int32 {
 	}
 	return sum
 }
+
+// SIMDSparseChunkMulAcc processes one non-zero input chunk across all outputs.
+// Scalar fallback implementation.
+func SIMDSparseChunkMulAcc(output []int32, weights []int8, outLen int, inputChunk uint32) {
+	if outLen == 0 || inputChunk == 0 {
+		return
+	}
+
+	// Unpack input bytes
+	b0 := uint8(inputChunk)
+	b1 := uint8(inputChunk >> 8)
+	b2 := uint8(inputChunk >> 16)
+	b3 := uint8(inputChunk >> 24)
+
+	// Process each output
+	for k := 0; k < outLen; k++ {
+		weightOffset := k * 4
+		output[k] += int32(weights[weightOffset+0]) * int32(b0)
+		output[k] += int32(weights[weightOffset+1]) * int32(b1)
+		output[k] += int32(weights[weightOffset+2]) * int32(b2)
+		output[k] += int32(weights[weightOffset+3]) * int32(b3)
+	}
+}

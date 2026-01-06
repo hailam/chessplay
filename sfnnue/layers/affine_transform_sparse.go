@@ -87,37 +87,45 @@ func (a *AffineTransformSparseInput) Propagate(input []uint8, output []int32) {
 	const chunkSize = 4
 	numChunks := common.CeilToMultiple(a.InputDimensions, 8) / chunkSize
 
+	// Use stack-allocated arrays to avoid heap allocation in hot path
+	// Max size: big network has InputDimensions=1024, so max 256 chunks
+	var input32Buf [256]int32
+	var nnzIndicesBuf [256]int
+	input32 := input32Buf[:numChunks]
+	nnzCount := 0
+
 	// Reinterpret input as int32 for chunk processing
-	input32 := make([]int32, (len(input)+3)/4)
-	for i := 0; i < len(input); i++ {
+	// BCE hint: prove bounds safety to compiler
+	inputLen := len(input)
+	if inputLen > 0 {
+		_ = input[inputLen-1]
+	}
+	for i := 0; i < inputLen; i++ {
 		input32[i/4] |= int32(input[i]) << (8 * (i % 4))
 	}
 
-	// Find non-zero chunks
-	nnzIndices := make([]int, 0, numChunks)
+	// Find non-zero chunks and collect indices
 	for i := 0; i < numChunks; i++ {
 		if input32[i] != 0 {
-			nnzIndices = append(nnzIndices, i)
+			nnzIndicesBuf[nnzCount] = i
+			nnzCount++
 		}
 	}
+	nnzIndices := nnzIndicesBuf[:nnzCount]
 
-	// Process only non-zero chunks
+	// BCE hints for inner loop
+	outLen := a.OutputDimensions
+	if outLen > 0 {
+		_ = output[outLen-1]
+	}
+
+	// Process only non-zero chunks using SIMD
 	for _, idx := range nnzIndices {
 		in := input32[idx]
-		// Unpack the 4 bytes
-		b0 := uint8(in)
-		b1 := uint8(in >> 8)
-		b2 := uint8(in >> 16)
-		b3 := uint8(in >> 24)
+		colOffset := idx * outLen * chunkSize
 
-		colOffset := idx * a.OutputDimensions * chunkSize
-
-		for k := 0; k < a.OutputDimensions; k++ {
-			weightOffset := colOffset + k*chunkSize
-			output[k] += int32(a.Weights[weightOffset+0]) * int32(b0)
-			output[k] += int32(a.Weights[weightOffset+1]) * int32(b1)
-			output[k] += int32(a.Weights[weightOffset+2]) * int32(b2)
-			output[k] += int32(a.Weights[weightOffset+3]) * int32(b3)
-		}
+		// Use SIMD for the inner loop: processes all outputs for this chunk
+		// The SIMD function handles the multiply-accumulate with horizontal sums
+		SIMDSparseChunkMulAcc(output[:outLen], a.Weights[colOffset:], outLen, uint32(in))
 	}
 }
