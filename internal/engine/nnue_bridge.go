@@ -329,7 +329,8 @@ func (w *Worker) ensureAccumulatorComputed(net *sfnnue.Network, acc *sfnnue.Accu
 }
 
 // nnueEvaluate performs NNUE evaluation for the worker's position.
-// Implements Stockfish's dual network selection and score combination.
+// Uses dual-network evaluation for better accuracy (working approach from Jan 5).
+// Adds optimism tracking for Stockfish-style score adjustments.
 func (w *Worker) nnueEvaluate() int {
 	if w.nnueNet == nil || w.nnueAcc == nil {
 		return EvaluateWithPawnTable(w.pos, w.pawnTable)
@@ -341,53 +342,68 @@ func (w *Worker) nnueEvaluate() int {
 		sideToMove = 1
 	}
 
-	// Stockfish network selection: use small if material advantage > 962
-	useSmall := w.simpleEval() > 962
+	// Get accumulators for both networks
+	bigAcc := w.nnueAcc.CurrentBig()
+	smallAcc := w.nnueAcc.CurrentSmall()
 
-	var psqt, positional int32
+	// Ensure accumulators are computed for both networks
+	w.ensureAccumulatorComputed(w.nnueNet.Big, bigAcc, false)
+	w.ensureAccumulatorComputed(w.nnueNet.Small, smallAcc, true)
 
-	if useSmall {
-		// Use small network
-		smallAcc := w.nnueAcc.CurrentSmall()
-		w.ensureAccumulatorComputed(w.nnueNet.Small, smallAcc, true)
-		psqt, positional = w.nnueNet.Small.Evaluate(
-			smallAcc.Accumulation,
-			smallAcc.PSQTAccumulation,
-			sideToMove,
-			pieceCount,
-			w.nnueAcc.TransformBuffer[:],
-		)
-	} else {
-		// Use big network
-		bigAcc := w.nnueAcc.CurrentBig()
-		w.ensureAccumulatorComputed(w.nnueNet.Big, bigAcc, false)
-		psqt, positional = w.nnueNet.Big.Evaluate(
-			bigAcc.Accumulation,
-			bigAcc.PSQTAccumulation,
-			sideToMove,
-			pieceCount,
-			w.nnueAcc.TransformBuffer[:],
-		)
+	// Big network evaluation
+	bigPsqt, bigPositional := w.nnueNet.Big.Evaluate(
+		bigAcc.Accumulation,
+		bigAcc.PSQTAccumulation,
+		sideToMove,
+		pieceCount,
+		w.nnueAcc.TransformBuffer[:],
+	)
+
+	// Small network evaluation (PSQT only - used for averaging)
+	smallPsqt, _ := w.nnueNet.Small.Evaluate(
+		smallAcc.Accumulation,
+		smallAcc.PSQTAccumulation,
+		sideToMove,
+		pieceCount,
+		w.nnueAcc.TransformBuffer[:],
+	)
+
+	// Combine: use big network's positional + averaged PSQT from both networks
+	// This is the working approach from Jan 5 that beat Stockfish level 3
+	score := int(bigPositional) + int(smallPsqt+bigPsqt)/2
+
+	// Get optimism for side to move (Stockfish evaluate.cpp)
+	optimism := w.optimism[sideToMove]
+
+	// Material-based score adjustment with optimism (simplified Stockfish formula)
+	// This adds a small optimism bonus scaled by material
+	pawnCount := popCount64(uint64(w.pos.Pieces[board.White][board.Pawn])) +
+		popCount64(uint64(w.pos.Pieces[board.Black][board.Pawn]))
+	material := 534*pawnCount + nonPawnMaterial(w.pos)
+
+	// Scale optimism by material (similar to Stockfish but with working base formula)
+	// optimism * (7191 + material) / 77871 adds a small optimism-based adjustment
+	score += optimism * (7191 + material) / 77871
+
+	// Rule50 dampening
+	rule50 := int(w.pos.HalfMoveClock)
+	score -= score * rule50 / 199
+
+	return score
+}
+
+// nonPawnMaterial calculates the total material value excluding pawns.
+// Used for material scaling in NNUE evaluation.
+func nonPawnMaterial(pos *board.Position) int {
+	// Knight=320, Bishop=330, Rook=500, Queen=900
+	pieceValues := [6]int{0, 320, 330, 500, 900, 0}
+	total := 0
+	for c := 0; c < 2; c++ {
+		for pt := board.Knight; pt <= board.Queen; pt++ {
+			total += popCount64(uint64(pos.Pieces[c][pt])) * pieceValues[pt]
+		}
 	}
-
-	// CORRECT Stockfish formula: (125 * psqt + 131 * positional) / 128
-	nnue := (125*int(psqt) + 131*int(positional)) / 128
-
-	// Re-evaluate with big network if small gave uncertain result (abs < 277)
-	if useSmall && absInt(nnue) < 277 {
-		bigAcc := w.nnueAcc.CurrentBig()
-		w.ensureAccumulatorComputed(w.nnueNet.Big, bigAcc, false)
-		psqt, positional = w.nnueNet.Big.Evaluate(
-			bigAcc.Accumulation,
-			bigAcc.PSQTAccumulation,
-			sideToMove,
-			pieceCount,
-			w.nnueAcc.TransformBuffer[:],
-		)
-		nnue = (125*int(psqt) + 131*int(positional)) / 128
-	}
-
-	return nnue
+	return total
 }
 
 // computeAccumulator computes the accumulator from scratch for a perspective.

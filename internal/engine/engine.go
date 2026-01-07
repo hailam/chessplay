@@ -566,6 +566,9 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 			return
 		}
 
+		// Update optimism before each depth (Stockfish search.cpp)
+		worker.UpdateOptimism()
+
 		var move board.Move
 		var score int
 
@@ -673,6 +676,9 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 		}
 
 		prevScore = score
+
+		// Update avgScore for optimism calculation (Stockfish search.cpp)
+		worker.UpdateAvgScore(score)
 
 		// Track score for volatility calculation
 		recentScores = append(recentScores, score)

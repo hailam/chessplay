@@ -67,7 +67,7 @@ test-elo: uci
 	$(CHESS_CLI) \
 		-each tc=13+0.1 \
 		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go \
-		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=3 \
+		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=3\ option.cpuprofile=$(PROFILE_OUTPUT) \
 		-concurrency 2 \
 		-rounds 100 \
 		-pgn results.pgn

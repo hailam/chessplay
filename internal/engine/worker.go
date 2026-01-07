@@ -104,6 +104,11 @@ type Worker struct {
 
 	// Current search depth (for result reporting)
 	depth int
+
+	// Optimism tracking (Stockfish evaluate.cpp)
+	// Used for material scaling: includes optimism term based on running average of root scores
+	optimism [2]int // Per-side optimism: [White=0, Black=1]
+	avgScore int    // Running average of root move score (initialized to -Infinity)
 }
 
 // WorkerResult contains the result from a worker's search at a given depth.
@@ -158,6 +163,47 @@ func (w *Worker) Nodes() uint64 {
 func (w *Worker) Reset() {
 	w.nodes = 0
 	w.orderer.Clear()
+	// Reset optimism tracking for new search
+	w.avgScore = -Infinity // Will be set to first score
+	w.optimism[0] = 0
+	w.optimism[1] = 0
+}
+
+// UpdateOptimism calculates optimism for the current iteration based on avgScore.
+// Should be called before each depth in iterative deepening.
+// Ported from Stockfish search.cpp iterative deepening loop.
+func (w *Worker) UpdateOptimism() {
+	avg := w.avgScore
+	if avg == -Infinity {
+		// No score yet - use 0 optimism
+		w.optimism[0] = 0
+		w.optimism[1] = 0
+		return
+	}
+
+	// Stockfish formula: 142 * avg / (abs(avg) + 91)
+	us := 0 // White = 0, Black = 1
+	if w.pos.SideToMove == board.Black {
+		us = 1
+	}
+
+	absAvg := avg
+	if absAvg < 0 {
+		absAvg = -absAvg
+	}
+	w.optimism[us] = (142 * avg) / (absAvg + 91)
+	w.optimism[1-us] = -w.optimism[us]
+}
+
+// UpdateAvgScore updates the running average score after each iteration.
+// Ported from Stockfish search.cpp.
+func (w *Worker) UpdateAvgScore(score int) {
+	if w.avgScore == -Infinity {
+		w.avgScore = score
+	} else {
+		// Running average: (score + avgScore) / 2
+		w.avgScore = (score + w.avgScore) / 2
+	}
 }
 
 // SetRootHistory sets the position history from the game (for repetition detection).
@@ -617,10 +663,38 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 	}
 
-	// Singular Extensions - DISABLED for debugging position corruption
-	// TODO: Re-enable after root cause is found
+	// Singular Extensions (Stockfish search.cpp)
+	// When TT move is significantly better than alternatives, extend it
 	singularExtension := 0
-	_ = singularExtension // Suppress unused warning
+	if depth >= 6 && ttMove != board.NoMove && excludedMove == board.NoMove && found {
+		// Check TT entry conditions:
+		// - TT depth is recent enough
+		// - TT bound includes lower bound (we know it's at least this good)
+		if int(ttEntry.Depth) >= depth-3 && (ttEntry.Flag == TTLowerBound || ttEntry.Flag == TTExact) {
+			// Stockfish formula: ttValue - (53 + 75*(ttPv && !PvNode)) * depth / 60
+			// isPvNode = true when we have full window (alpha < beta - 1)
+			isPvNode := alpha < beta-1
+			margin := 53
+			if ttPv && !isPvNode {
+				margin = 128 // 53 + 75
+			}
+			ttValue := AdjustScoreFromTT(int(ttEntry.Score), ply)
+			singularBeta := ttValue - margin*depth/60
+
+			// Search at reduced depth excluding the TT move
+			singularDepth := (depth - 1) / 2
+			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove)
+
+			// If all other moves fail low, extend the TT move
+			if singularScore < singularBeta {
+				singularExtension = 1
+				// Double extension if far below (Stockfish triple extension logic simplified)
+				if singularScore < singularBeta-50 {
+					singularExtension = 2
+				}
+			}
+		}
+	}
 
 	// Generate moves
 	moves := w.pos.GenerateLegalMoves()

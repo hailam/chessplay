@@ -152,13 +152,15 @@ func (n *NetworkArchitecture) Propagate(transformedFeatures []uint8) int32 {
 	// Forward pass
 	n.FC0.Propagate(transformedFeatures, fc0Out)
 	n.AcSqr0.Propagate(fc0Out, acSqr0Out[:n.FC0Outputs])
-	n.Ac0.Propagate(fc0Out, ac0Out)
+	// Use SIMD ClippedReLU for performance (WeightScaleBits = 6)
+	SIMDClippedReLU(fc0Out, ac0Out, 6)
 
 	// Concatenate sqr and regular relu outputs (nnue_architecture.h:127-128)
 	copy(acSqr0Out[n.FC0Outputs:], ac0Out[:n.FC0Outputs])
 
 	n.FC1.Propagate(acSqr0Out, fc1Out)
-	n.Ac1.Propagate(fc1Out, ac1Out)
+	// Use SIMD ClippedReLU for performance (WeightScaleBits = 6)
+	SIMDClippedReLU(fc1Out, ac1Out, 6)
 	n.FC2.Propagate(ac1Out, fc2Out)
 
 	// Add forward output from fc0_out[FC_0_OUTPUTS] (nnue_architecture.h:133-137)
