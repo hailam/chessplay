@@ -109,6 +109,10 @@ type Worker struct {
 	// Used for material scaling: includes optimism term based on running average of root scores
 	optimism [2]int // Per-side optimism: [White=0, Black=1]
 	avgScore int    // Running average of root move score (initialized to -Infinity)
+
+	// Root delta for LMR scaling (Stockfish search.cpp)
+	// Width of the initial aspiration window at root, used to scale reductions
+	rootDelta int
 }
 
 // WorkerResult contains the result from a worker's search at a given depth.
@@ -551,9 +555,10 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 	}
 
-	// Razoring (Stockfish: depth <= 3)
-	if depth <= 3 && !inCheck && ply > 0 {
-		razorMargin := 300 + 100*depth
+	// Razoring (Stockfish search.cpp:873)
+	// Use quadratic formula: 485 + 281*depth*depth (much more aggressive)
+	if depth <= 5 && !inCheck && ply > 0 && !ttPv {
+		razorMargin := 485 + 281*depth*depth
 		if staticEval+razorMargin <= alpha {
 			score := w.quiescence(ply, alpha, beta)
 			if score <= alpha {
@@ -562,10 +567,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 	}
 
-	// Null Move Pruning
+	// Null Move Pruning (Stockfish search.cpp:893-924)
 	// Don't do NMP in PV nodes to preserve principal variation
 	if !inCheck && depth >= 3 && ply > 0 && !ttPv && w.pos.HasNonPawnMaterial() {
-		R := 2 + depth/4
+		// Stockfish: R = 7 + depth/3 (more aggressive than our previous 2 + depth/4)
+		R := 7 + depth/3
 		if R > depth-1 {
 			R = depth - 1
 		}
@@ -580,11 +586,24 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	}
 
 	// Probcut - prune if a shallow search of captures exceeds beta by a margin
+	// Stockfish (search.cpp:938): probCutBeta = beta + 235 - 63 * improving
+	// probCutDepth = clamp(depth - 5 - (staticEval-beta)/315, 0, depth)
 	if depth >= probcutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
-		probcutBeta := beta + probcutMargin
-		probcutSearchDepth := depth - probcutReduction
+		// Adaptive margin: 235 - 63 when improving, 235 when not
+		adaptiveMargin := 235
+		if improving {
+			adaptiveMargin -= 63
+		}
+		probcutBeta := beta + adaptiveMargin
+
+		// Adaptive depth based on eval (Stockfish formula)
+		evalDiff := staticEval - beta
+		probcutSearchDepth := depth - 5 - evalDiff/315
 		if probcutSearchDepth < 1 {
 			probcutSearchDepth = 1
+		}
+		if probcutSearchDepth > depth {
+			probcutSearchDepth = depth
 		}
 
 		captures := w.pos.GenerateCaptures()
@@ -663,7 +682,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 	}
 
-	// Singular Extensions (Stockfish search.cpp)
+	// Singular Extensions (Stockfish search.cpp:1129-1157)
 	// When TT move is significantly better than alternatives, extend it
 	singularExtension := 0
 	if depth >= 6 && ttMove != board.NoMove && excludedMove == board.NoMove && found {
@@ -685,12 +704,40 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			singularDepth := (depth - 1) / 2
 			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove)
 
-			// If all other moves fail low, extend the TT move
+			// If all other moves fail low, extend the TT move (Stockfish double/triple extension)
 			if singularScore < singularBeta {
+				// Check if TT move is a capture for margin calculations
+				ttCapture := ttMove.IsCapture(w.pos)
+
+				// Stockfish's complex margin formulas (search.cpp:1140-1157)
+				// doubleMargin: -4 + 199*PvNode - 201*!ttCapture
+				// tripleMargin: 73 + 302*PvNode - 248*!ttCapture + 90*ttPv
+				doubleMargin := -4
+				if isPvNode {
+					doubleMargin += 199
+				}
+				if !ttCapture {
+					doubleMargin -= 201
+				}
+
+				tripleMargin := 73
+				if isPvNode {
+					tripleMargin += 302
+				}
+				if !ttCapture {
+					tripleMargin -= 248
+				}
+				if ttPv {
+					tripleMargin += 90
+				}
+
+				// Calculate extension level
 				singularExtension = 1
-				// Double extension if far below (Stockfish triple extension logic simplified)
-				if singularScore < singularBeta-50 {
+				if singularScore < singularBeta-doubleMargin {
 					singularExtension = 2
+				}
+				if singularScore < singularBeta-tripleMargin {
+					singularExtension = 3
 				}
 			}
 		}
@@ -878,12 +925,24 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			}
 			reduction := lmrReductions[d][m]
 
-			// Adjustments
+			// Stockfish's rootDelta scaling (search.cpp:1736)
+			// Scales reduction inversely with aspiration window width
+			// Narrower windows (confident positions) get less reduction
+			if w.rootDelta > 0 && w.rootDelta < Infinity {
+				delta := beta - alpha
+				reduction -= delta * 608 / w.rootDelta
+			}
+
+			// Adjustments based on node type and position
 			if !improving {
 				reduction++
 			}
 			if move == ttMove {
 				reduction -= 2
+			}
+			if ttPv {
+				// Reduce less in TT PV positions (Stockfish: + 946 / 1024)
+				reduction--
 			}
 
 			// Calculate statScore: combine main history + continuation histories
@@ -910,6 +969,9 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 			// Apply statScore to reduction (Stockfish: r -= statScore * 850 / 8192)
 			reduction -= statScore * 850 / 8192
+
+			// Stockfish: reduce more for later moves in move ordering (moveCount factor)
+			reduction -= movesSearched * 73 / 1024
 
 			// Ensure reduction is reasonable
 			if reduction < 1 {

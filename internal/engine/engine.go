@@ -610,6 +610,10 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 			beta := prevScore + window
 			retryCount := 0
 
+			// Set rootDelta for LMR scaling (Stockfish search.cpp:354)
+			// Initial aspiration window width used to scale reductions
+			worker.rootDelta = window * 2 // beta - alpha = 2 * window
+
 			for {
 				// DEBUG: Verify position before search
 				if board.DebugMoveValidation {
@@ -657,6 +661,9 @@ func (e *Engine) workerSearch(workerID int, pos *board.Position, maxDepth int, r
 			}
 		} else {
 			// DEBUG: Verify position before search
+			// For non-aspiration searches, use a large rootDelta
+			worker.rootDelta = Infinity // Full window search
+
 			if board.DebugMoveValidation {
 				if worker.Pos().Pieces[board.White][board.King] == 0 {
 					log.Printf("ENGINE: White King MISSING BEFORE SearchDepth (non-asp)! depth=%d", depth)
