@@ -143,9 +143,6 @@ func NewGame() *Game {
 	// Load preferences
 	g.loadPreferences()
 
-	// Set initial engine difficulty
-	g.engine.SetDifficulty(engine.Medium)
-
 	g.panel = NewPanel(g)
 	g.feedback = NewFeedbackManager()
 	g.glass = NewGlassEffect()
