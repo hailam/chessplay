@@ -454,6 +454,10 @@ func (u *UCI) calculateTimeForMove(opts GoOptions) time.Duration {
 		moveTime = 10 * time.Millisecond
 	}
 
+	// Debug logging for time management diagnosis
+	fmt.Printf("info string time_allocated=%dms moves_remaining=%d our_time=%dms our_inc=%dms\n",
+		moveTime.Milliseconds(), movesRemaining, ourTime.Milliseconds(), ourInc.Milliseconds())
+
 	return moveTime
 }
 

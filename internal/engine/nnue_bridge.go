@@ -254,106 +254,140 @@ func (w *Worker) computeFeatureDeltas(perspective, ksq int) (removed, added []in
 	return removedBuf[:removedCount], addedBuf[:addedCount]
 }
 
+// simpleEval returns the absolute material advantage for network selection.
+// Stockfish uses this to decide small vs big network (threshold 962).
+func (w *Worker) simpleEval() int {
+	pos := w.pos
+	score := 0
+	// Pawn=100, Knight=320, Bishop=330, Rook=500, Queen=900
+	pieceValues := [6]int{100, 320, 330, 500, 900, 0}
+
+	for pt := board.Pawn; pt <= board.Queen; pt++ {
+		whitePieces := popCount64(uint64(pos.Pieces[board.White][pt]))
+		blackPieces := popCount64(uint64(pos.Pieces[board.Black][pt]))
+		score += (whitePieces - blackPieces) * pieceValues[pt]
+	}
+
+	if pos.SideToMove == board.Black {
+		score = -score
+	}
+	return absInt(score)
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func popCount64(x uint64) int {
+	count := 0
+	for x != 0 {
+		x &= x - 1
+		count++
+	}
+	return count
+}
+
+// ensureAccumulatorComputed updates or recomputes the accumulator for the given network.
+func (w *Worker) ensureAccumulatorComputed(net *sfnnue.Network, acc *sfnnue.Accumulator, isSmall bool) {
+	var prevAcc *sfnnue.Accumulator
+	if isSmall {
+		prevAcc = w.nnueAcc.PreviousSmall()
+	} else {
+		prevAcc = w.nnueAcc.PreviousBig()
+	}
+
+	for perspective := 0; perspective < 2; perspective++ {
+		if acc.Computed[perspective] {
+			continue
+		}
+
+		// Check if we can do incremental update
+		canIncremental := prevAcc != nil &&
+			prevAcc.Computed[perspective] &&
+			!acc.NeedsRefresh[perspective] &&
+			w.dirtyState.Computed && w.dirtyState.Count > 0
+
+		if canIncremental {
+			ksq := int(w.pos.KingSquare[perspective])
+			removed, added := w.computeFeatureDeltas(perspective, ksq)
+
+			net.FeatureTransformer.UpdateAccumulator(
+				removed, added,
+				acc.Accumulation[perspective],
+				acc.PSQTAccumulation[perspective],
+			)
+			acc.Computed[perspective] = true
+			acc.KingSq[perspective] = ksq
+		} else {
+			// Full recomputation required
+			computeAccumulator(net, w.pos, acc, perspective, w.activeIndicesBuffer[:])
+		}
+	}
+}
+
 // nnueEvaluate performs NNUE evaluation for the worker's position.
+// Implements Stockfish's dual network selection and score combination.
 func (w *Worker) nnueEvaluate() int {
 	if w.nnueNet == nil || w.nnueAcc == nil {
 		return EvaluateWithPawnTable(w.pos, w.pawnTable)
 	}
 
 	pieceCount := countPieces(w.pos)
-
-	// Get current and previous accumulators
-	bigAcc := w.nnueAcc.CurrentBig()
-	smallAcc := w.nnueAcc.CurrentSmall()
-	prevBig := w.nnueAcc.PreviousBig()
-	prevSmall := w.nnueAcc.PreviousSmall()
-
-	// Update or recompute accumulators for each perspective
-	for perspective := 0; perspective < 2; perspective++ {
-		// Check if already computed (rare - only at root or after full refresh)
-		if bigAcc.Computed[perspective] && smallAcc.Computed[perspective] {
-			continue
-		}
-
-		// Check if we can do incremental update:
-		// 1. Have a previous accumulator
-		// 2. Previous was computed for this perspective
-		// 3. No king move for this perspective (NeedsRefresh is false)
-		// 4. Dirty state was computed with changes
-		canIncremental := prevBig != nil && prevSmall != nil &&
-			prevBig.Computed[perspective] && prevSmall.Computed[perspective] &&
-			!bigAcc.NeedsRefresh[perspective] &&
-			w.dirtyState.Computed && w.dirtyState.Count > 0
-
-		if canIncremental {
-			// Incremental update: only process changed features
-			// Note: Push() already copied parent accumulators to current level,
-			// so we just need to apply the delta with UpdateAccumulator directly
-			// (no need for ForwardUpdateIncremental which would copy again)
-			ksq := int(w.pos.KingSquare[perspective])
-			removed, added := w.computeFeatureDeltas(perspective, ksq)
-
-			// Apply incremental update to big network
-			if !bigAcc.Computed[perspective] {
-				w.nnueNet.Big.FeatureTransformer.UpdateAccumulator(
-					removed, added,
-					bigAcc.Accumulation[perspective],
-					bigAcc.PSQTAccumulation[perspective],
-				)
-				bigAcc.Computed[perspective] = true
-				bigAcc.KingSq[perspective] = ksq
-			}
-
-			// Apply incremental update to small network
-			if !smallAcc.Computed[perspective] {
-				w.nnueNet.Small.FeatureTransformer.UpdateAccumulator(
-					removed, added,
-					smallAcc.Accumulation[perspective],
-					smallAcc.PSQTAccumulation[perspective],
-				)
-				smallAcc.Computed[perspective] = true
-				smallAcc.KingSq[perspective] = ksq
-			}
-		} else {
-			// Full recomputation required (king moved, no previous, or root)
-			if !bigAcc.Computed[perspective] {
-				computeAccumulator(w.nnueNet.Big, w.pos, bigAcc, perspective, w.activeIndicesBuffer[:])
-			}
-			if !smallAcc.Computed[perspective] {
-				computeAccumulator(w.nnueNet.Small, w.pos, smallAcc, perspective, w.activeIndicesBuffer[:])
-			}
-		}
-	}
-
-	// Evaluate using both networks
 	sideToMove := 0
 	if w.pos.SideToMove == board.Black {
 		sideToMove = 1
 	}
 
-	// Big network evaluation (use pre-allocated transform buffer from accumulator stack)
-	bigPsqt, bigPositional := w.nnueNet.Big.Evaluate(
-		bigAcc.Accumulation,
-		bigAcc.PSQTAccumulation,
-		sideToMove,
-		pieceCount,
-		w.nnueAcc.TransformBuffer[:],
-	)
+	// Stockfish network selection: use small if material advantage > 962
+	useSmall := w.simpleEval() > 962
 
-	// Small network evaluation (PSQT only, reuses same transform buffer)
-	smallPsqt, _ := w.nnueNet.Small.Evaluate(
-		smallAcc.Accumulation,
-		smallAcc.PSQTAccumulation,
-		sideToMove,
-		pieceCount,
-		w.nnueAcc.TransformBuffer[:],
-	)
+	var psqt, positional int32
 
-	// Combine: use big network's positional + small network's PSQT
-	// This matches Stockfish's approach
-	score := int(bigPositional) + int(smallPsqt+bigPsqt)/2
+	if useSmall {
+		// Use small network
+		smallAcc := w.nnueAcc.CurrentSmall()
+		w.ensureAccumulatorComputed(w.nnueNet.Small, smallAcc, true)
+		psqt, positional = w.nnueNet.Small.Evaluate(
+			smallAcc.Accumulation,
+			smallAcc.PSQTAccumulation,
+			sideToMove,
+			pieceCount,
+			w.nnueAcc.TransformBuffer[:],
+		)
+	} else {
+		// Use big network
+		bigAcc := w.nnueAcc.CurrentBig()
+		w.ensureAccumulatorComputed(w.nnueNet.Big, bigAcc, false)
+		psqt, positional = w.nnueNet.Big.Evaluate(
+			bigAcc.Accumulation,
+			bigAcc.PSQTAccumulation,
+			sideToMove,
+			pieceCount,
+			w.nnueAcc.TransformBuffer[:],
+		)
+	}
 
-	return score
+	// CORRECT Stockfish formula: (125 * psqt + 131 * positional) / 128
+	nnue := (125*int(psqt) + 131*int(positional)) / 128
+
+	// Re-evaluate with big network if small gave uncertain result (abs < 277)
+	if useSmall && absInt(nnue) < 277 {
+		bigAcc := w.nnueAcc.CurrentBig()
+		w.ensureAccumulatorComputed(w.nnueNet.Big, bigAcc, false)
+		psqt, positional = w.nnueNet.Big.Evaluate(
+			bigAcc.Accumulation,
+			bigAcc.PSQTAccumulation,
+			sideToMove,
+			pieceCount,
+			w.nnueAcc.TransformBuffer[:],
+		)
+		nnue = (125*int(psqt) + 131*int(positional)) / 128
+	}
+
+	return nnue
 }
 
 // computeAccumulator computes the accumulator from scratch for a perspective.
