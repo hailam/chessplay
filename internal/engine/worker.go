@@ -41,6 +41,12 @@ type SearchStack struct {
 
 	// Statistical score for history-based decisions
 	statScore int
+
+	// Reduction applied at this ply (for hindsight depth adjustment)
+	reduction int
+
+	// Count of beta cutoffs at this ply (for LMR scaling)
+	cutoffCnt int
 }
 
 // Worker represents a search worker for parallel Lazy SMP search.
@@ -113,6 +119,10 @@ type Worker struct {
 	// Root delta for LMR scaling (Stockfish search.cpp)
 	// Width of the initial aspiration window at root, used to scale reductions
 	rootDelta int
+
+	// NMP verification: minimum ply where NMP is allowed (Stockfish search.cpp:892-925)
+	// When set > 0, NMP is disabled until ply exceeds this value
+	nmpMinPly int
 }
 
 // WorkerResult contains the result from a worker's search at a given depth.
@@ -271,7 +281,7 @@ func (w *Worker) SearchDepth(depth, alpha, beta int) (board.Move, int) {
 		}
 	}
 
-	score := w.negamax(depth, 0, alpha, beta, board.NoMove, board.NoMove)
+	score := w.negamax(depth, 0, alpha, beta, board.NoMove, board.NoMove, false)
 
 	var bestMove board.Move
 	if w.pv.length[0] > 0 {
@@ -368,7 +378,8 @@ func (w *Worker) isDraw() bool {
 
 // negamax implements the negamax algorithm with alpha-beta pruning.
 // excludedMove is used for singular extension search - if not NoMove, this move will be skipped.
-func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move) int {
+// cutNode indicates expected node type: true if we expect a beta cutoff (most children are cut-nodes).
+func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move, cutNode bool) int {
 	// Bounds check to prevent array overflow (can happen with high depth + extensions)
 	// Use MaxPly-1 because we access pv.length[ply+1] inside this function
 	if ply >= MaxPly-1 {
@@ -543,6 +554,35 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		improving = staticEval > w.evalStack[ply-2]
 	}
 
+	// opponentWorsening heuristic (Stockfish search.cpp:751)
+	// True if opponent's position is worsening (our eval improved vs their last eval)
+	opponentWorsening := false
+	if ply >= 1 {
+		opponentWorsening = staticEval > -w.evalStack[ply-1]
+	}
+
+	// Hindsight depth adjustment (Stockfish search.cpp:754-757)
+	// Adjust depth based on how the previous ply's LMR prediction turned out
+	if ply >= 1 {
+		priorReduction := w.searchStack[ply-1].reduction
+		// If we reduced a lot and opponent isn't getting worse, search deeper
+		if priorReduction >= 3 && !opponentWorsening {
+			depth++
+		}
+		// If we reduced and position eval sum suggests stability, search shallower
+		if priorReduction >= 2 && depth >= 2 {
+			evalSum := staticEval + w.evalStack[ply-1]
+			if evalSum > 173 {
+				depth--
+			}
+		}
+	}
+
+	// Initialize cutoffCnt for grandchild nodes (Stockfish search.cpp:699)
+	if ply+2 < MaxPly {
+		w.searchStack[ply+2].cutoffCnt = 0
+	}
+
 	// Reverse Futility Pruning
 	// Reduce aggressiveness in PV nodes (ttPv)
 	if !inCheck && depth <= 6 && ply > 0 && !ttPv {
@@ -577,11 +617,11 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 
 		nullUndo := w.pos.MakeNullMove()
-		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove, board.NoMove)
+		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove, board.NoMove, !cutNode)
 		w.pos.UnmakeNullMove(nullUndo)
 
 		if nullScore >= beta {
-			return beta
+			return nullScore
 		}
 	}
 
@@ -623,7 +663,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				continue
 			}
 
-			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture, board.NoMove)
+			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture, board.NoMove, !cutNode)
 			w.pos.UnmakeMove(capture, undo)
 			w.nnuePop()
 
@@ -660,7 +700,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			}
 			mcSearched++
 
-			score := -w.negamax(mcSearchDepth, ply+1, -beta, -beta+1, move, board.NoMove)
+			score := -w.negamax(mcSearchDepth, ply+1, -beta, -beta+1, move, board.NoMove, !cutNode)
 			w.pos.UnmakeMove(move, undo)
 			w.nnuePop()
 
@@ -702,7 +742,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 			// Search at reduced depth excluding the TT move
 			singularDepth := (depth - 1) / 2
-			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove)
+			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove, cutNode)
 
 			// If all other moves fail low, extend the TT move (Stockfish double/triple extension)
 			if singularScore < singularBeta {
@@ -738,6 +778,16 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				}
 				if singularScore < singularBeta-tripleMargin {
 					singularExtension = 3
+				}
+			} else {
+				// Negative extensions (Stockfish search.cpp:1158-1165)
+				// TT move is NOT singular - other moves are also good
+				// Reduce depth instead of extending
+				ttValue := AdjustScoreFromTT(int(ttEntry.Score), ply)
+				if ttValue >= beta {
+					singularExtension = -3 // Strong reduction when TT value beats beta
+				} else if cutNode {
+					singularExtension = -2 // Moderate reduction at cut nodes
 				}
 			}
 		}
@@ -827,6 +877,9 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			}
 		}
 
+		// SEE-based quiet pruning disabled: Our SEE only handles captures
+		// TODO: Implement proper SEE for quiet moves (check if piece is safe on destination)
+
 		// DEBUG: Verify position consistency BEFORE checking piece
 		{
 			var whiteSum, blackSum board.Bitboard
@@ -908,7 +961,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		var score int
 		newDepth := depth - 1 + extension
 
-		if move == ttMove && singularExtension > 0 {
+		// Apply singular extension (positive) or negative extension (reduction)
+		if move == ttMove && singularExtension != 0 {
 			newDepth += singularExtension
 		}
 
@@ -943,6 +997,44 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			if ttPv {
 				// Reduce less in TT PV positions (Stockfish: + 946 / 1024)
 				reduction--
+			}
+
+			// Stockfish cutNode scaling (search.cpp:1199)
+			// Cut nodes get extra reduction: r += 3372 + 997 * !ttMove (in 1024 units)
+			if cutNode {
+				extra := 3372
+				if ttMove == board.NoMove {
+					extra += 997
+				}
+				reduction += extra / 1024
+			}
+
+			// allNode classification: nodes that are neither PV nor cut
+			// These nodes expect to search all moves, so reduce more aggressively
+			isPvNode := alpha < beta-1
+			allNode := !isPvNode && !cutNode
+			if allNode && depth > 2 {
+				// Extra reduction proportional to depth for all-nodes
+				reduction += reduction / (depth + 1)
+			}
+
+			// cutoffCnt scaling (Stockfish search.cpp:1208-1210)
+			// If next ply had multiple cutoffs, increase reduction
+			if ply+1 < MaxPly {
+				cutoffCnt := w.searchStack[ply+1].cutoffCnt
+				if cutoffCnt > 1 {
+					extra := 120
+					if cutoffCnt > 2 {
+						extra += 1024
+					}
+					if cutoffCnt > 3 {
+						extra += 100
+					}
+					if allNode {
+						extra += 1024
+					}
+					reduction += extra / 1024
+				}
 			}
 
 			// Calculate statScore: combine main history + continuation histories
@@ -983,17 +1075,23 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				reducedDepth = 1
 			}
 
-			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move, board.NoMove)
+			// Store reduction for hindsight depth adjustment (Stockfish search.cpp:754-757)
+			w.searchStack[ply].reduction = reduction
+
+			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode)
 
 			if score > alpha {
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
 			}
 		} else if movesSearched == 1 {
-			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
+			// First move: PV node, cutNode=false
+			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
 		} else {
-			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move, board.NoMove)
+			// PVS: null window search with flipped cutNode
+			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode)
 			if score > alpha && score < beta {
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove)
+				// Re-search with full window: PV-like, cutNode=false
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
 			}
 		}
 
@@ -1058,6 +1156,13 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 		// Beta cutoff
 		if score >= beta {
+			// Update cutoffCnt (Stockfish search.cpp:1375)
+			// Increment when extension < 2 or at PV nodes
+			isPvNode := alpha < beta-1
+			if extension < 2 || isPvNode {
+				w.searchStack[ply].cutoffCnt++
+			}
+
 			if ply == 0 && bestMove != board.NoMove {
 				w.pv.moves[0][0] = bestMove
 				w.pv.length[0] = 1

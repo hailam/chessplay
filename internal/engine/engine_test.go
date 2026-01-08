@@ -163,3 +163,26 @@ func TestPawnHashTable(t *testing.T) {
 
 	t.Logf("PawnKey: %016x", pos.PawnKey)
 }
+
+// BenchmarkSearch benchmarks the search function for profiling.
+// Run with: go test -cpuprofile=cpu.prof -bench=BenchmarkSearch ./internal/engine/
+// View profile: go tool pprof -http=:8080 cpu.prof
+func BenchmarkSearch(b *testing.B) {
+	pos := board.NewPosition()
+	eng := NewEngine(16) // 16MB TT
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		limits := SearchLimits{Depth: 10}
+		eng.SearchWithLimits(pos, limits)
+	}
+}
+
+// BenchmarkClear benchmarks just the MoveOrderer.Clear() function
+func BenchmarkClear(b *testing.B) {
+	orderer := NewMoveOrderer()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		orderer.Clear()
+	}
+}

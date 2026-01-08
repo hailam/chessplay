@@ -166,7 +166,7 @@ func (mo *MoveOrderer) Clear() {
 		}
 	}
 
-	// Age countermove history
+	// Age countermove history (12*64*12*64 = 589,824 ints)
 	for i := range mo.countermoveHistory {
 		for j := range mo.countermoveHistory[i] {
 			for k := range mo.countermoveHistory[i][j] {
@@ -177,7 +177,7 @@ func (mo *MoveOrderer) Clear() {
 		}
 	}
 
-	// Age continuation history
+	// Age continuation history (12*64*12*64 = 589,824 ints)
 	for i := range mo.continuationHistory {
 		for j := range mo.continuationHistory[i] {
 			for k := range mo.continuationHistory[i][j] {

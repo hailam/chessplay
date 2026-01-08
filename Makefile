@@ -83,8 +83,8 @@ profile-elo: uci
 		-each tc=10+0.1 \
 		-engine cmd=$(BINARY_UCI) name=ChessPlay-Go option.cpuprofile=$(PROFILE_OUTPUT) \
 		-engine cmd=$(STOCKFISH) name=Stockfish option.Skill\ Level=4 \
-		-concurrency 1 \
-		-rounds 4 \
+		-concurrency 5 \
+		-rounds 10 \
 		-pgn results.pgn
 	@echo ""
 	@echo "=== CPU Profile Summary ==="
