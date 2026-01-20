@@ -186,3 +186,30 @@ func BenchmarkClear(b *testing.B) {
 		orderer.Clear()
 	}
 }
+
+// BenchmarkMoveScoring benchmarks move scoring for SIMD analysis
+func BenchmarkMoveScoring(b *testing.B) {
+	pos := board.NewPosition()
+	orderer := NewMoveOrderer()
+	moves := pos.GenerateLegalMoves()
+	prevMove := board.NewMove(board.E2, board.E4) // Simulate previous move
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		orderer.ScoreMovesWithCounter(pos, moves, 1, board.NoMove, prevMove)
+	}
+}
+
+// BenchmarkScoreMove benchmarks individual move scoring
+func BenchmarkScoreMove(b *testing.B) {
+	pos := board.NewPosition()
+	orderer := NewMoveOrderer()
+	moves := pos.GenerateLegalMoves()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < moves.Len(); j++ {
+			orderer.scoreMove(pos, moves.Get(j), 1, board.NoMove)
+		}
+	}
+}

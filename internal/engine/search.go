@@ -35,6 +35,28 @@ const (
 	threatExtensionThreshold = 200 // Minimum material value to trigger extension (Knight/Bishop value)
 )
 
+// Feature flags for A/B testing
+// Set to false to disable feature and measure ELO impact
+const (
+	// Tier 1: High-Risk Pruning
+	EnableProbcut     = false // worker.go: Probcut pruning - DISABLED (+6% ELO)
+	EnableMulticut    = true  // worker.go: Multi-cut pruning
+	EnableRazoring    = true  // worker.go: Razoring
+	EnableSingularExt = true  // worker.go: Singular extension - ESSENTIAL
+	EnableThreatExt   = true  // worker.go: Threat extension - ESSENTIAL
+
+	// Tier 2: Medium-Risk Pruning
+	EnableRFP             = true // worker.go: Reverse Futility Pruning
+	EnableLMP             = true // worker.go: Late Move Pruning
+	EnableSEEPruning      = true // worker.go: SEE pruning for captures
+	EnableHistoryPruning  = true // worker.go: History pruning
+	EnableFutilityPruning = true // worker.go: Futility pruning
+
+	// Tier 3: Extensions/Reductions
+	EnableHindsightDepth = true // worker.go: Hindsight depth adjustment
+	EnableNMP            = true // worker.go: Null Move Pruning
+)
+
 // PVTable stores the principal variation.
 type PVTable struct {
 	length [MaxPly]int

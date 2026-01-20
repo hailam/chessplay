@@ -535,7 +535,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	}
 
 	// Threat extension
-	if extension == 0 && depth >= threatExtensionMinDepth && ply > 0 {
+	if EnableThreatExt && extension == 0 && depth >= threatExtensionMinDepth && ply > 0 {
 		if w.detectSeriousThreats() {
 			extension = 1
 		}
@@ -563,7 +563,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Hindsight depth adjustment (Stockfish search.cpp:754-757)
 	// Adjust depth based on how the previous ply's LMR prediction turned out
-	if ply >= 1 {
+	if EnableHindsightDepth && ply >= 1 {
 		priorReduction := w.searchStack[ply-1].reduction
 		// If we reduced a lot and opponent isn't getting worse, search deeper
 		if priorReduction >= 3 && !opponentWorsening {
@@ -585,7 +585,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Reverse Futility Pruning
 	// Reduce aggressiveness in PV nodes (ttPv)
-	if !inCheck && depth <= 6 && ply > 0 && !ttPv {
+	if EnableRFP && !inCheck && depth <= 6 && ply > 0 && !ttPv {
 		rfpMargin := 80 * depth
 		if !improving {
 			rfpMargin -= 20
@@ -597,7 +597,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Razoring (Stockfish search.cpp:873)
 	// Use quadratic formula: 485 + 281*depth*depth (much more aggressive)
-	if depth <= 5 && !inCheck && ply > 0 && !ttPv {
+	if EnableRazoring && depth <= 5 && !inCheck && ply > 0 && !ttPv {
 		razorMargin := 485 + 281*depth*depth
 		if staticEval+razorMargin <= alpha {
 			score := w.quiescence(ply, alpha, beta)
@@ -609,7 +609,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Null Move Pruning (Stockfish search.cpp:893-924)
 	// Don't do NMP in PV nodes to preserve principal variation
-	if !inCheck && depth >= 3 && ply > 0 && !ttPv && w.pos.HasNonPawnMaterial() {
+	if EnableNMP && !inCheck && depth >= 3 && ply > 0 && !ttPv && w.pos.HasNonPawnMaterial() {
 		// Stockfish: R = 7 + depth/3 (more aggressive than our previous 2 + depth/4)
 		R := 7 + depth/3
 		if R > depth-1 {
@@ -628,7 +628,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	// Probcut - prune if a shallow search of captures exceeds beta by a margin
 	// Stockfish (search.cpp:938): probCutBeta = beta + 235 - 63 * improving
 	// probCutDepth = clamp(depth - 5 - (staticEval-beta)/315, 0, depth)
-	if depth >= probcutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
+	if EnableProbcut && depth >= probcutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
 		// Adaptive margin: 235 - 63 when improving, 235 when not
 		adaptiveMargin := 235
 		if improving {
@@ -674,7 +674,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	}
 
 	// Multi-Cut - if multiple moves fail high at reduced depth, prune
-	if depth >= multicutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
+	if EnableMulticut && depth >= multicutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
 		mcMoves := w.pos.GenerateLegalMoves()
 		mcScores := w.orderer.ScoreMovesWithCounter(w.pos, mcMoves, ply, ttMove, prevMove)
 
@@ -715,7 +715,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Futility Pruning flag (Stockfish: depth <= 5)
 	pruneQuietMoves := false
-	if depth <= 5 && !inCheck && ply > 0 {
+	if EnableFutilityPruning && depth <= 5 && !inCheck && ply > 0 {
 		futilityMargin := []int{0, 200, 300, 500, 700, 900}
 		if staticEval+futilityMargin[depth] <= alpha {
 			pruneQuietMoves = true
@@ -725,7 +725,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	// Singular Extensions (Stockfish search.cpp:1129-1157)
 	// When TT move is significantly better than alternatives, extend it
 	singularExtension := 0
-	if depth >= 6 && ttMove != board.NoMove && excludedMove == board.NoMove && found {
+	if EnableSingularExt && depth >= 6 && ttMove != board.NoMove && excludedMove == board.NoMove && found {
 		// Check TT entry conditions:
 		// - TT depth is recent enough
 		// - TT bound includes lower bound (we know it's at least this good)
@@ -845,13 +845,13 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		isCapture := move.IsCapture(w.pos)
 		isPromotion := move.IsPromotion()
 
-		// Futility pruning
-		if pruneQuietMoves && !isCapture && !isPromotion && bestMove != board.NoMove {
+		// Futility pruning (in move loop)
+		if EnableFutilityPruning && pruneQuietMoves && !isCapture && !isPromotion && bestMove != board.NoMove {
 			continue
 		}
 
 		// SEE pruning - prune bad captures at low depths (Stockfish: depth <= 7)
-		if isCapture && depth <= 7 && !inCheck && movesSearched > 0 {
+		if EnableSEEPruning && isCapture && depth <= 7 && !inCheck && movesSearched > 0 {
 			// Scale threshold based on depth: deeper = more permissive
 			seeThreshold := -20 * depth
 			if SEE(w.pos, move) < seeThreshold {
@@ -860,7 +860,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 
 		// Late Move Pruning (LMP)
-		if depth <= 7 && !inCheck && movesSearched > 0 && !isCapture && !isPromotion && move != ttMove {
+		if EnableLMP && depth <= 7 && !inCheck && movesSearched > 0 && !isCapture && !isPromotion && move != ttMove {
 			threshold := lmpThreshold[depth]
 			if !improving {
 				threshold = threshold * 2 / 3
@@ -871,7 +871,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 
 		// History Pruning
-		if depth <= 3 && !inCheck && movesSearched > 0 && !isCapture && !isPromotion && move != ttMove {
+		if EnableHistoryPruning && depth <= 3 && !inCheck && movesSearched > 0 && !isCapture && !isPromotion && move != ttMove {
 			if w.orderer.GetHistoryScore(move) < historyPruningThreshold {
 				continue
 			}
