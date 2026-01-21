@@ -281,7 +281,7 @@ func (w *Worker) SearchDepth(depth, alpha, beta int) (board.Move, int) {
 		}
 	}
 
-	score := w.negamax(depth, 0, alpha, beta, board.NoMove, board.NoMove, false)
+	score := w.negamax(depth, 0, alpha, beta, board.NoMove, board.NoMove, false, true)
 
 	var bestMove board.Move
 	if w.pv.length[0] > 0 {
@@ -379,7 +379,8 @@ func (w *Worker) isDraw() bool {
 // negamax implements the negamax algorithm with alpha-beta pruning.
 // excludedMove is used for singular extension search - if not NoMove, this move will be skipped.
 // cutNode indicates expected node type: true if we expect a beta cutoff (most children are cut-nodes).
-func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move, cutNode bool) int {
+// pvNode indicates if this is a principal variation node (full window search, first move continuation).
+func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove board.Move, cutNode, pvNode bool) int {
 	// Bounds check to prevent array overflow (can happen with high depth + extensions)
 	// Use MaxPly-1 because we access pv.length[ply+1] inside this function
 	if ply >= MaxPly-1 {
@@ -584,8 +585,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 	}
 
 	// Reverse Futility Pruning
-	// Reduce aggressiveness in PV nodes (ttPv)
-	if EnableRFP && !inCheck && depth <= 6 && ply > 0 && !ttPv {
+	// Never prune at PV nodes (pvNode)
+	if EnableRFP && !inCheck && depth <= 6 && ply > 0 && !pvNode {
 		rfpMargin := 80 * depth
 		if !improving {
 			rfpMargin -= 20
@@ -597,7 +598,8 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Razoring (Stockfish search.cpp:873)
 	// Use quadratic formula: 485 + 281*depth*depth (much more aggressive)
-	if EnableRazoring && depth <= 5 && !inCheck && ply > 0 && !ttPv {
+	// CRITICAL: Never razor at PV nodes (must use pvNode, NOT ttPv)
+	if EnableRazoring && depth <= 5 && !inCheck && ply > 0 && !pvNode {
 		razorMargin := 485 + 281*depth*depth
 		if staticEval+razorMargin <= alpha {
 			score := w.quiescence(ply, alpha, beta)
@@ -609,7 +611,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Null Move Pruning (Stockfish search.cpp:893-924)
 	// Don't do NMP in PV nodes to preserve principal variation
-	if EnableNMP && !inCheck && depth >= 3 && ply > 0 && !ttPv && w.pos.HasNonPawnMaterial() {
+	if EnableNMP && !inCheck && depth >= 3 && ply > 0 && !pvNode && w.pos.HasNonPawnMaterial() {
 		// Stockfish: R = 7 + depth/3 (more aggressive than our previous 2 + depth/4)
 		R := 7 + depth/3
 		if R > depth-1 {
@@ -617,7 +619,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 		}
 
 		nullUndo := w.pos.MakeNullMove()
-		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove, board.NoMove, !cutNode)
+		nullScore := -w.negamax(depth-1-R, ply+1, -beta, -beta+1, board.NoMove, board.NoMove, !cutNode, false)
 		w.pos.UnmakeNullMove(nullUndo)
 
 		if nullScore >= beta {
@@ -627,14 +629,31 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 	// Probcut - prune if a shallow search of captures exceeds beta by a margin
 	// Stockfish (search.cpp:938): probCutBeta = beta + 235 - 63 * improving
-	// probCutDepth = clamp(depth - 5 - (staticEval-beta)/315, 0, depth)
-	if EnableProbcut && depth >= probcutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
+	// FIXES from Stockfish audit:
+	// 1. Never at PV nodes (!pvNode)
+	// 2. Skip if beta is decisive (mate score)
+	// 3. TT guard: skip if TT already provides a good cutoff
+	// 4. Return adjusted value: score - (probcutBeta - beta)
+	if EnableProbcut && depth >= probcutDepth && !inCheck && ply > 0 && !pvNode {
+		// Skip if beta is already decisive (winning mate)
+		if abs(beta) >= MateScore-MaxPly {
+			goto skipProbcut
+		}
+
 		// Adaptive margin: 235 - 63 when improving, 235 when not
 		adaptiveMargin := 235
 		if improving {
 			adaptiveMargin -= 63
 		}
 		probcutBeta := beta + adaptiveMargin
+
+		// TT guard: skip if we already have a TT cutoff at sufficient depth
+		if found && int(ttEntry.Depth) >= depth-3 {
+			ttValue := AdjustScoreFromTT(int(ttEntry.Score), ply)
+			if (ttEntry.Flag == TTLowerBound || ttEntry.Flag == TTExact) && ttValue >= probcutBeta {
+				goto skipProbcut
+			}
+		}
 
 		// Adaptive depth based on eval (Stockfish formula)
 		evalDiff := staticEval - beta
@@ -663,55 +682,21 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				continue
 			}
 
-			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture, board.NoMove, !cutNode)
+			score := -w.negamax(probcutSearchDepth, ply+1, -probcutBeta, -probcutBeta+1, capture, board.NoMove, !cutNode, false)
 			w.pos.UnmakeMove(capture, undo)
 			w.nnuePop()
 
 			if score >= probcutBeta {
-				return score
+				// Return adjusted value to fit within [alpha, beta] window (Stockfish fix)
+				return score - (probcutBeta - beta)
 			}
 		}
 	}
+skipProbcut:
 
-	// Multi-Cut - if multiple moves fail high at reduced depth, prune
-	if EnableMulticut && depth >= multicutDepth && !inCheck && ply > 0 && abs(beta) < MateScore-100 {
-		mcMoves := w.pos.GenerateLegalMoves()
-		mcScores := w.orderer.ScoreMovesWithCounter(w.pos, mcMoves, ply, ttMove, prevMove)
-
-		mcCutoffs := 0
-		mcSearched := 0
-		mcSearchDepth := depth - 4
-		if mcSearchDepth < 1 {
-			mcSearchDepth = 1
-		}
-
-		for i := 0; i < mcMoves.Len() && mcSearched < multicutMoves; i++ {
-			PickMove(mcMoves, mcScores, i)
-			move := mcMoves.Get(i)
-
-			w.computeDirtyPieces(move) // Track piece changes for incremental NNUE
-			w.nnuePush()
-			undo := w.pos.MakeMove(move)
-			if !undo.Valid {
-				// Move is illegal - undo and try next
-				w.pos.UnmakeMove(move, undo)
-				w.nnuePop()
-				continue
-			}
-			mcSearched++
-
-			score := -w.negamax(mcSearchDepth, ply+1, -beta, -beta+1, move, board.NoMove, !cutNode)
-			w.pos.UnmakeMove(move, undo)
-			w.nnuePop()
-
-			if score >= beta {
-				mcCutoffs++
-				if mcCutoffs >= multicutRequired {
-					return beta
-				}
-			}
-		}
-	}
+	// NOTE: Standalone Multi-Cut has been REMOVED
+	// Multi-Cut is now correctly integrated into Singular Extension (see Case 2 above)
+	// When singularScore >= beta, we prune there instead of here
 
 	// Futility Pruning flag (Stockfish: depth <= 5)
 	pruneQuietMoves := false
@@ -742,7 +727,7 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 
 			// Search at reduced depth excluding the TT move
 			singularDepth := (depth - 1) / 2
-			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove, cutNode)
+			singularScore := w.negamax(singularDepth, ply, singularBeta-1, singularBeta, prevMove, ttMove, cutNode, false)
 
 			// If all other moves fail low, extend the TT move (Stockfish double/triple extension)
 			if singularScore < singularBeta {
@@ -779,9 +764,14 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 				if singularScore < singularBeta-tripleMargin {
 					singularExtension = 3
 				}
+			} else if singularScore >= beta && abs(singularScore) < MateScore-MaxPly {
+				// Case 2: MULTI-CUT (Stockfish search.cpp:1160-1164)
+				// Other moves also fail high at beta - prune the entire subtree
+				// This is the correct architecture for Multi-Cut, integrated into Singular Extension
+				return singularScore
 			} else {
-				// Negative extensions (Stockfish search.cpp:1158-1165)
-				// TT move is NOT singular - other moves are also good
+				// Case 3: Negative extensions (Stockfish search.cpp:1173-1180)
+				// TT move is NOT singular - other moves are also good at singularBeta but not beta
 				// Reduce depth instead of extending
 				ttValue := AdjustScoreFromTT(int(ttEntry.Score), ply)
 				if ttValue >= beta {
@@ -1078,20 +1068,20 @@ func (w *Worker) negamax(depth, ply int, alpha, beta int, prevMove, excludedMove
 			// Store reduction for hindsight depth adjustment (Stockfish search.cpp:754-757)
 			w.searchStack[ply].reduction = reduction
 
-			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode)
+			score = -w.negamax(reducedDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode, false)
 
 			if score > alpha {
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false, false)
 			}
 		} else if movesSearched == 1 {
-			// First move: PV node, cutNode=false
-			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
+			// First move: PV node continues if parent is PV
+			score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false, pvNode)
 		} else {
 			// PVS: null window search with flipped cutNode
-			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode)
+			score = -w.negamax(newDepth, ply+1, -alpha-1, -alpha, move, board.NoMove, !cutNode, false)
 			if score > alpha && score < beta {
-				// Re-search with full window: PV-like, cutNode=false
-				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false)
+				// Re-search with full window (not PV since not first move)
+				score = -w.negamax(newDepth, ply+1, -beta, -alpha, move, board.NoMove, false, false)
 			}
 		}
 

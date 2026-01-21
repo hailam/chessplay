@@ -15,14 +15,12 @@ const (
 
 // Pruning constants
 const (
-	lazyEvalMargin           = 150   // Lazy eval margin for quiescence
-	historyPruningThreshold  = -4000 // History pruning threshold
-	probcutDepth             = 8     // Minimum depth for probcut
-	probcutMargin            = 200   // Probcut margin above beta
-	probcutReduction         = 4     // Probcut depth reduction
-	multicutDepth            = 8     // Minimum depth for multi-cut
-	multicutMoves            = 6     // Number of moves to try
-	multicutRequired         = 3     // Number of cutoffs needed
+	lazyEvalMargin          = 150   // Lazy eval margin for quiescence
+	historyPruningThreshold = -4000 // History pruning threshold
+	probcutDepth            = 3     // Minimum depth for probcut (Stockfish uses 3)
+	probcutMargin           = 200   // Probcut margin above beta
+	probcutReduction        = 4     // Probcut depth reduction
+	// NOTE: Multi-Cut constants removed - now integrated into Singular Extension
 )
 
 // LMP (Late Move Pruning) thresholds by depth
@@ -39,11 +37,10 @@ const (
 // Set to false to disable feature and measure ELO impact
 const (
 	// Tier 1: High-Risk Pruning
-	EnableProbcut     = false // worker.go: Probcut pruning - DISABLED (+6% ELO)
-	EnableMulticut    = true  // worker.go: Multi-cut pruning
-	EnableRazoring    = true  // worker.go: Razoring
-	EnableSingularExt = true  // worker.go: Singular extension - ESSENTIAL
-	EnableThreatExt   = true  // worker.go: Threat extension - ESSENTIAL
+	EnableProbcut     = true // worker.go: Probcut pruning - FIXED with Stockfish improvements
+	EnableRazoring    = true // worker.go: Razoring
+	EnableSingularExt = true // worker.go: Singular extension - includes integrated Multi-Cut
+	EnableThreatExt   = true // worker.go: Threat extension - ESSENTIAL
 
 	// Tier 2: Medium-Risk Pruning
 	EnableRFP             = true // worker.go: Reverse Futility Pruning
