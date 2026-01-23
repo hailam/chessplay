@@ -43,11 +43,11 @@ const (
 	EnableThreatExt   = true // worker.go: Threat extension - ESSENTIAL
 
 	// Tier 2: Medium-Risk Pruning
-	EnableRFP             = true // worker.go: Reverse Futility Pruning
-	EnableLMP             = true // worker.go: Late Move Pruning
-	EnableSEEPruning      = true // worker.go: SEE pruning for captures
-	EnableHistoryPruning  = true // worker.go: History pruning
-	EnableFutilityPruning = true // worker.go: Futility pruning
+	EnableRFP             = false // worker.go: Reverse Futility Pruning - DISABLED (+10%)
+	EnableLMP             = true  // worker.go: Late Move Pruning - KEEP (helps)
+	EnableSEEPruning      = true  // worker.go: SEE pruning for captures
+	EnableHistoryPruning  = false // worker.go: History pruning - DISABLED (+3.5%)
+	EnableFutilityPruning = true  // worker.go: Futility pruning - KEEP (helps)
 
 	// Tier 3: Extensions/Reductions
 	EnableHindsightDepth = true // worker.go: Hindsight depth adjustment
